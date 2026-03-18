@@ -1,12 +1,28 @@
 """
-PhishGuard - Phase 6: Multilingual Support + Demo Polish
-=========================================================
-Extends Phase 5 with:
-  - LANGUAGE_TEMPLATES : localised scam/safe messages in English, Hindi, Marathi
-  - DetectRequest      : now accepts optional `language` field (default "en")
-  - detect()           : resolves template, appends user_message + user_action
-                         to response so end-users get plain-language warnings
-                         in their preferred language
+PhishGuard v2.0 — Multi-Signal Scoring Engine
+==============================================
+Production-grade upgrade over Phase 6. Detection is now layered:
+
+  Signal Layer 1 — Keyword matching       (per-category weighted scores)
+  Signal Layer 2 — Combo boost logic      (dangerous category combinations)
+  Signal Layer 3 — Linguistic signals     (imperative tone, urgency phrases)
+  Signal Layer 4 — Safe-pattern defence   (negation / awareness phrases)
+  Signal Layer 5 — URL intelligence       (TLD abuse, brand impersonation,
+                                           hyphenated fake domains)
+
+Scoring thresholds:
+  >= 70  → is_scam = True,  status = "scam"
+  >= 40  → is_scam = False, status = "suspicious"
+  <  40  → is_scam = False, status = "safe"
+
+New output fields (backward-compatible):
+  primary_category, secondary_categories, confidence_score, url_risk_flags,
+  status, safe_signals_detected
+
+Existing fields preserved:
+  is_scam, risk_score, category, red_flags, impact, action,
+  explanation_markdown, detected_urls, url_analysis,
+  matched_categories, matched_keywords, user_message, user_action
 """
 
 import re
@@ -16,89 +32,84 @@ import uvicorn
 import tldextract
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 
-# ---------------------------------------------------------------------------
-# App Initialisation
-# ---------------------------------------------------------------------------
+# =============================================================================
+# App
+# =============================================================================
 
 app = FastAPI(
     title="PhishGuard API",
-    description="Phishing & scam detection service",
-    version="0.6.0",
+    description="Multi-signal phishing & scam detection engine",
+    version="2.0.0",
 )
 
-# ---------------------------------------------------------------------------
-# Language Templates  (Phase 6)
-# Plain-language verdicts for end-users — no API required, fully offline.
-# Add more languages here without touching any detection logic.
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Language Templates  (Phase 6 — unchanged)
+# =============================================================================
 
 LANGUAGE_TEMPLATES = {
     "en": {
-        "scam": "⚠️ This appears to be a scam.",
-        "safe": "✅ This looks safe.",
-        "action": "Do not click any links or share sensitive information.",
+        "scam":        "⚠️ This appears to be a scam.",
+        "suspicious":  "🔶 This message looks suspicious.",
+        "safe":        "✅ This looks safe.",
+        "action":      "Do not click any links or share sensitive information.",
     },
     "hi": {
-        "scam": "⚠️ यह एक धोखाधड़ी लगती है।",
-        "safe": "✅ यह सुरक्षित लगता है।",
-        "action": "किसी भी लिंक पर क्लिक न करें या निजी जानकारी साझा न करें।",
+        "scam":        "⚠️ यह एक धोखाधड़ी लगती है।",
+        "suspicious":  "🔶 यह संदिग्ध लगता है।",
+        "safe":        "✅ यह सुरक्षित लगता है।",
+        "action":      "किसी भी लिंक पर क्लिक न करें या निजी जानकारी साझा न करें।",
     },
     "mr": {
-        "scam": "⚠️ हे फसवणूक असू शकते.",
-        "safe": "✅ हे सुरक्षित वाटते.",
-        "action": "कोणत्याही लिंकवर क्लिक करू नका किंवा वैयक्तिक माहिती देऊ नका.",
+        "scam":        "⚠️ हे फसवणूक असू शकते.",
+        "suspicious":  "🔶 हे संशयास्पद वाटते.",
+        "safe":        "✅ हे सुरक्षित वाटते.",
+        "action":      "कोणत्याही लिंकवर क्लिक करू नका किंवा वैयक्तिक माहिती देऊ नका.",
     },
 }
 
-# ---------------------------------------------------------------------------
+# =============================================================================
 # Request Schema
-# ---------------------------------------------------------------------------
+# =============================================================================
 
 class DetectRequest(BaseModel):
-    """Accepts either a raw text snippet or a URL (at least one is required).
-    Optionally specify a language code for localised user-facing messages.
-    Supported: 'en' (English), 'hi' (Hindi), 'mr' (Marathi). Defaults to 'en'.
-    """
+    """Payload for /detect. Supply text, url, or both. Language defaults to 'en'."""
     text:     Optional[str] = None
     url:      Optional[str] = None
     language: Optional[str] = "en"
 
+# =============================================================================
+# ─── SIGNAL LAYER 0: URL Helpers ─────────────────────────────────────────────
+# =============================================================================
 
-# ---------------------------------------------------------------------------
-# URL Helpers  (Phase 2 — unchanged)
-# ---------------------------------------------------------------------------
-
-_URL_PATTERN = re.compile(
-    r"https?://"
-    r"(?:[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+)",
+_URL_RE = re.compile(
+    r"https?://(?:[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+)",
     re.IGNORECASE,
 )
 
 
-def extract_urls(text: str) -> list:
-    """Extract all http/https URLs from text. Returns bare URL as list if input is a URL."""
+def extract_urls(text: str) -> List[str]:
+    """Return all http/https URLs found in text. Treats bare URL input as single-element list."""
     text = text.strip()
     if re.match(r"^https?://\S+$", text, re.IGNORECASE):
         return [text]
-    return _URL_PATTERN.findall(text)
+    return _URL_RE.findall(text)
 
 
 def parse_url(url: str) -> dict:
-    """Break a URL into domain components using tldextract."""
-    extracted = tldextract.extract(url)
+    """Decompose a URL into domain parts via tldextract."""
+    ext = tldextract.extract(url)
     return {
         "full_url":  url,
-        "domain":    extracted.domain,
-        "subdomain": extracted.subdomain,
-        "suffix":    extracted.suffix,
+        "domain":    ext.domain,
+        "subdomain": ext.subdomain,
+        "suffix":    ext.suffix,
     }
 
-
-# ---------------------------------------------------------------------------
-# Scam Pattern Dictionary  (Phase 3)
-# ---------------------------------------------------------------------------
+# =============================================================================
+# ─── SIGNAL LAYER 1: Keyword Patterns ────────────────────────────────────────
+# =============================================================================
 
 SCAM_PATTERNS = {
     "upi_scam": [
@@ -107,33 +118,29 @@ SCAM_PATTERNS = {
         "wrong transfer", "mistakenly transferred",
         "return the money", "send back money",
         "share upi pin", "enter upi pin",
-        # Hindi variants
-        "पेमेंट रिक्वेस्ट", "यूपीआई पिन", "पैसे वापस करें",
-        "गलती से ट्रांसफर",
+        # Hindi
+        "पेमेंट रिक्वेस्ट", "यूपीआई पिन", "पैसे वापस करें", "गलती से ट्रांसफर",
     ],
     "otp_scam": [
         "share otp", "enter otp", "verification code",
-        "transaction otp", "bank otp",
-        "otp for verification",
-        # Hindi variants
-        "ओटीपी शेयर करें", "ओटीपी दर्ज करें", "ओटीपी बताएं",
-        "वेरिफिकेशन कोड",
+        "transaction otp", "bank otp", "otp for verification",
+        # Hindi
+        "ओटीपी शेयर करें", "ओटीपी दर्ज करें", "ओटीपी बताएं", "वेरिफिकेशन कोड",
     ],
     "bank_scam": [
         "account blocked", "account suspended",
         "kyc expired", "update kyc",
         "reactivate account", "verify account", "verify your account",
         "unblock account", "suspicious activity",
-        # Hindi variants
+        # Hindi
         "खाता बंद", "केवाईसी अपडेट", "kyc अपडेट", "बैंक खाता बंद",
         "अकाउंट ब्लॉक", "खाता निलंबित",
     ],
     "urgency": [
         "urgent", "immediately", "action required",
-        "within 24 hours", "act now",
-        "last chance", "expires soon",
-        "avoid penalty",
-        # Hindi variants
+        "within 24 hours", "act now", "last chance",
+        "expires soon", "avoid penalty",
+        # Hindi
         "तुरंत", "अभी करें", "जल्दी करें", "अंतिम मौका",
         "24 घंटे में", "अभी क्लिक करें",
     ],
@@ -142,360 +149,458 @@ SCAM_PATTERNS = {
         "cash prize", "lucky draw", "lucky winner",
         "claim your prize", "claim prize", "claim now",
         "reward money", "processing fee",
-        # Hindi variants
+        # Hindi
         "आपने जीता", "₹5000 जीता", "इनाम जीता", "लकी ड्रा",
         "पुरस्कार जीता", "अभी क्लेम करें", "नकद पुरस्कार",
     ],
     "tax_scam": [
         "income tax refund", "refund pending",
         "pan blocked", "link aadhaar",
-        "verify pan", "tax department",
-        "claim refund",
-        # Hindi variants
+        "verify pan", "tax department", "claim refund",
+        # Hindi
         "आयकर रिफंड", "पैन ब्लॉक", "आधार लिंक", "रिफंड लंबित",
     ],
     "delivery_scam": [
-        "delivery failed", "parcel held",
-        "address issue", "reschedule delivery",
-        "redelivery", "confirm delivery",
-        "delivery otp",
-        # Hindi variants
+        "delivery failed", "parcel held", "address issue",
+        "reschedule delivery", "redelivery", "confirm delivery", "delivery otp",
+        # Hindi
         "डिलीवरी फेल", "पार्सल रोका", "पता सही करें",
     ],
     "loan_scam": [
-        "instant loan", "loan approved",
-        "loan in 5 minutes", "no credit check",
-        "instant approval", "loan offer",
-        "processing fee",
-        # Hindi variants
+        "instant loan", "loan approved", "loan in 5 minutes",
+        "no credit check", "instant approval", "loan offer", "processing fee",
+        # Hindi
         "तुरंत लोन", "लोन अप्रूव", "5 मिनट में लोन",
     ],
     "digital_arrest_scam": [
-        "digital arrest", "arrest warrant",
-        "case registered", "under investigation",
-        "illegal parcel", "money laundering",
-        "freeze account", "police case",
-        "video call now", "prove innocence",
-        # Hindi variants
+        "digital arrest", "arrest warrant", "case registered",
+        "under investigation", "illegal parcel", "money laundering",
+        "freeze account", "police case", "video call now", "prove innocence",
+        # Hindi
         "डिजिटल अरेस्ट", "गिरफ्तारी वारंट", "मनी लॉन्ड्रिंग",
         "पुलिस केस", "निर्दोषिता साबित",
     ],
     "challan_scam": [
-        "pending challan", "traffic violation",
-        "pay fine", "license suspended",
-        "unpaid fine", "vehicle violation",
-        "e-challan link",
-        # Hindi variants
+        "pending challan", "traffic violation", "pay fine",
+        "license suspended", "unpaid fine", "vehicle violation", "e-challan link",
+        # Hindi
         "चालान", "ई-चालान", "जुर्माना भरें", "लाइसेंस निलंबित",
     ],
     "scheme_scam": [
-        "pm kisan", "pension benefit",
-        "government scheme", "subsidy",
-        "bonus payment", "extra payment",
-        "verify aadhaar",
-        # Hindi variants
-        "सरकारी योजना", "सब्सिडी", "आधार वेरिफाई", "पेंशन लाभ",
-        "पीएम किसान",
+        "pm kisan", "pension benefit", "government scheme", "subsidy",
+        "bonus payment", "extra payment", "verify aadhaar",
+        # Hindi
+        "सरकारी योजना", "सब्सिडी", "आधार वेरिफाई", "पेंशन लाभ", "पीएम किसान",
     ],
     "family_emergency_scam": [
-        "road accident", "hospitalised",
-        "medical emergency", "need urgent help",
-        "send money urgently", "in hospital",
-        # Hindi variants
-        "सड़क दुर्घटना", "अस्पताल में", "मेडिकल इमरजेंसी",
-        "तुरंत पैसे भेजें",
+        "road accident", "hospitalised", "medical emergency",
+        "need urgent help", "send money urgently", "in hospital",
+        # Hindi
+        "सड़क दुर्घटना", "अस्पताल में", "मेडिकल इमरजेंसी", "तुरंत पैसे भेजें",
     ],
     "scholarship_scam": [
-        "scholarship", "education grant",
-        "student benefit", "claim scholarship",
-        # Hindi variants
+        "scholarship", "education grant", "student benefit", "claim scholarship",
+        # Hindi
         "छात्रवृत्ति", "शिक्षा अनुदान",
     ],
 }
 
-# ---------------------------------------------------------------------------
-# Red Flag Rules  (Phase 3)
-# Maps scam category → human-readable warning shown in results.
-# A category can trigger multiple flags; flags are deduplicated before return.
-# ---------------------------------------------------------------------------
-
-RED_FLAG_RULES = {
-    "urgency":                 "Contains urgent language",
-    "otp_scam":                "Mentions OTP / verification code",
-    "upi_scam":                "Mentions UPI payment or PIN",
-    "prize_scam":              "Claims reward or prize",
-    "bank_scam":               "Threatens account block or KYC action",
-    "tax_scam":                "References tax refund or PAN/Aadhaar",
-    "delivery_scam":           "Mentions failed delivery or parcel issue",
-    "loan_scam":               "Promises instant loan or approval",
-    "digital_arrest_scam":     "Uses digital arrest or legal threat language",
-    "challan_scam":            "Mentions traffic fine or e-challan",
-    "scheme_scam":             "References government scheme or subsidy",
-    "family_emergency_scam":   "Claims family emergency requiring money",
-    "scholarship_scam":        "Mentions scholarship or education grant",
-}
-
-
-# ---------------------------------------------------------------------------
-# Category Risk Weights  (Phase 4)
-# Each value represents how many risk points that category contributes.
-# Higher = more dangerous signal.
-# ---------------------------------------------------------------------------
-
-CATEGORY_WEIGHTS = {
-    "upi_scam":              30,
-    "otp_scam":              35,
-    "bank_scam":             30,
+# Per-category base weights (v2: tuned to reduce false positives at boundaries)
+SCAM_WEIGHTS = {
+    "upi_scam":              25,
+    "otp_scam":              30,
+    "bank_scam":             35,
     "urgency":               15,
-    "prize_scam":            25,
+    "prize_scam":            20,
     "tax_scam":              25,
     "delivery_scam":         20,
     "loan_scam":             20,
     "digital_arrest_scam":   40,
-    "challan_scam":          25,
-    "scheme_scam":           20,
-    "family_emergency_scam": 30,
-    "scholarship_scam":      20,
+    "challan_scam":          20,
+    "scheme_scam":           15,
+    "family_emergency_scam": 25,
+    "scholarship_scam":      15,
 }
 
-# ---------------------------------------------------------------------------
-# URL Risk Constants  (Phase 5)
-# ---------------------------------------------------------------------------
-
-# TLDs frequently abused in phishing campaigns (free / low-cost / unregulated)
-SUSPICIOUS_TLDS = {
-    "xyz", "top", "gq", "tk", "ml", "cf", "click", "zip", "work",
+# Human-readable flag labels per category
+CATEGORY_FLAG_LABELS = {
+    "urgency":               "Contains urgent / pressure language",
+    "otp_scam":              "Requests OTP or verification code",
+    "upi_scam":              "Mentions UPI payment or PIN sharing",
+    "prize_scam":            "Claims reward, prize, or lucky draw",
+    "bank_scam":             "Threatens account block or KYC action",
+    "tax_scam":              "References tax refund or PAN/Aadhaar",
+    "delivery_scam":         "Mentions failed delivery or parcel issue",
+    "loan_scam":             "Promises instant loan or approval",
+    "digital_arrest_scam":   "Uses digital arrest or legal threat language",
+    "challan_scam":          "Mentions traffic fine or e-challan",
+    "scheme_scam":           "References government scheme or subsidy",
+    "family_emergency_scam": "Claims family emergency requiring funds",
+    "scholarship_scam":      "Mentions scholarship or education grant",
 }
 
-# Well-known Indian and global brands commonly impersonated in scam URLs
-KNOWN_BRANDS = {
-    "paytm", "phonepe", "gpay", "googlepay", "amazon",
-    "flipkart", "sbi", "hdfc", "icici", "axis",
-}
+# =============================================================================
+# ─── SIGNAL LAYER 2: Combo Boosts ────────────────────────────────────────────
+# =============================================================================
+
+# Each entry: (set_of_required_categories, trigger_keyword_or_None, boost_points, label)
+COMBO_BOOSTS = [
+    ({"bank_scam", "urgency"},           None,      20, "Bank threat + urgency combined"),
+    ({"upi_scam"},                       "approve", 25, "UPI approve request — classic scam pattern"),
+    ({"prize_scam"},                     "fee",     20, "Prize + fee demand — advance fee scam"),
+    ({"prize_scam", "urgency"},          None,      25, "Prize claim + urgency — pressure scam"),
+    ({"otp_scam", "bank_scam"},          None,      15, "OTP + bank threat — credential phishing"),
+    ({"digital_arrest_scam", "urgency"}, None,      20, "Digital arrest + urgency — high-pressure scam"),
+]
 
 
-# ---------------------------------------------------------------------------
-# Keyword Detection  (Phase 3)
-# ---------------------------------------------------------------------------
-
-def detect_keywords(text: str) -> dict:
+def apply_combo_boosts(categories: set, lowered_text: str) -> tuple[int, List[str]]:
     """
-    Scan input text against SCAM_PATTERNS and return all matches.
+    Check all COMBO_BOOSTS rules.
 
-    Args:
-        text: Raw input string (will be lowercased internally).
-
-    Returns:
-        {
-            "matched_categories": list of category names that matched,
-            "matched_keywords":   list of individual keywords that matched,
-        }
+    Returns (total_boost_points, list_of_triggered_combo_labels).
     """
+    boost  = 0
+    labels = []
+    for required_cats, keyword, points, label in COMBO_BOOSTS:
+        # All required categories must be present
+        if not required_cats.issubset(categories):
+            continue
+        # Optional keyword check
+        if keyword and keyword not in lowered_text:
+            continue
+        boost  += points
+        labels.append(label)
+    return boost, labels
+
+# =============================================================================
+# ─── SIGNAL LAYER 3: Linguistic Signals ──────────────────────────────────────
+# =============================================================================
+
+# Imperative verb patterns that increase confidence without adding full category weight
+_IMPERATIVE_PATTERNS = re.compile(
+    r"\b(click|call|send|pay|share|verify|confirm|update|submit|approve|transfer|download)\b",
+    re.IGNORECASE,
+)
+
+_URGENCY_PHRASES = [
+    "do not ignore", "failure to", "or else", "otherwise",
+    "legal action", "consequences", "penalty", "blocked",
+]
+
+
+def detect_linguistic_signals(text: str) -> tuple[int, List[str]]:
+    """
+    Detect imperative tone and urgency amplifiers.
+
+    Returns (score_boost, list_of_signal_labels).
+    These are soft signals — they increase confidence but contribute
+    only modestly to the raw score.
+    """
+    boost   = 0
+    signals = []
     lowered = text.lower()
-    matched_categories: list = []
-    matched_keywords:   list = []
 
-    for category, keywords in SCAM_PATTERNS.items():
-        for keyword in keywords:
-            if keyword in lowered:
-                # Record category once even if multiple keywords hit
-                if category not in matched_categories:
-                    matched_categories.append(category)
-                # Record each individual keyword match
-                if keyword not in matched_keywords:
-                    matched_keywords.append(keyword)
+    imperatives = _IMPERATIVE_PATTERNS.findall(text)
+    unique_imperatives = list({v.lower() for v in imperatives})
+    if len(unique_imperatives) >= 2:
+        boost += 10
+        signals.append(f"Multiple imperative verbs detected: {', '.join(unique_imperatives[:4])}")
 
-    return {
-        "matched_categories": matched_categories,
-        "matched_keywords":   matched_keywords,
-    }
+    for phrase in _URGENCY_PHRASES:
+        if phrase in lowered:
+            boost += 5
+            signals.append(f"Urgency amplifier: '{phrase}'")
+            break  # one amplifier flag per message is sufficient
+
+    return boost, signals
+
+# =============================================================================
+# ─── SIGNAL LAYER 4: Safe Patterns (False Positive Reduction) ────────────────
+# =============================================================================
+
+SAFE_PATTERNS = [
+    # Awareness / advisory phrases — the message is warning AGAINST sharing
+    "do not share otp",
+    "never share your otp",
+    "bank will never ask",
+    "never share your pin",
+    "do not share your pin",
+    "beware of fraud",
+    "this is a scam",
+    "report fraud",
+    "protect yourself",
+    "stay safe from",
+    # Hindi awareness variants
+    "ओटीपी किसी से साझा न करें",
+    "बैंक कभी नहीं मांगता",
+    "धोखाधड़ी से सावधान",
+]
+
+# Score reduction applied per safe pattern match
+_SAFE_PATTERN_PENALTY = -30
 
 
-def build_red_flags(matched_categories: list) -> list:
+def detect_safe_signals(text: str) -> tuple[int, List[str]]:
     """
-    Convert a list of matched category names into human-readable red flag strings.
+    Scan for awareness / advisory phrases that indicate the message is
+    ABOUT scams rather than being a scam itself.
 
-    Args:
-        matched_categories: Output from detect_keywords().
-
-    Returns:
-        Deduplicated list of red flag description strings.
+    Returns (score_delta, list_of_matched_safe_patterns).
+    Score delta is negative — it reduces the raw risk score.
     """
-    flags = []
-    for category in matched_categories:
-        flag = RED_FLAG_RULES.get(category)
-        if flag and flag not in flags:
-            flags.append(flag)
-    return flags
+    lowered   = text.lower()
+    reduction = 0
+    matched   = []
 
+    for pattern in SAFE_PATTERNS:
+        if pattern in lowered:
+            reduction += _SAFE_PATTERN_PENALTY
+            matched.append(pattern)
 
-# ---------------------------------------------------------------------------
-# URL Risk Analysis  (Phase 5)
-# ---------------------------------------------------------------------------
+    return reduction, matched
+
+# =============================================================================
+# ─── SIGNAL LAYER 5: URL Intelligence ────────────────────────────────────────
+# =============================================================================
+
+SUSPICIOUS_TLDS = {"xyz", "top", "gq", "tk", "ml", "cf", "click", "zip", "work", "ru"}
+
+TRUSTED_BRANDS  = {"paytm", "phonepe", "gpay", "googlepay", "google", "amazon",
+                   "flipkart", "sbi", "hdfc", "icici", "axis", "upi", "bank"}
+
+# Official domain allow-list — these are genuine and must not be flagged
+_OFFICIAL_DOMAINS = {
+    "google", "amazon", "flipkart", "sbi", "hdfcbank",
+    "icicibank", "axisbank", "paytm", "phonepe",
+}
+
 
 def analyze_url_risk(url_info: dict) -> dict:
     """
-    Score a single parsed URL for domain-level phishing indicators.
+    Score a single parsed URL across three heuristics:
+      1. Suspicious TLD
+      2. Brand impersonation (brand name present but domain is NOT the official one)
+      3. Hyphenated fake domain (e.g. "secure-login-paytm")
 
-    Checks:
-      - Suspicious TLD (e.g. .xyz, .tk)
-      - Brand name + hyphen pattern (impersonation signal)
-      - Excessively long domain name
-
-    Args:
-        url_info: A dict returned by parse_url() with keys:
-                  full_url, domain, subdomain, suffix.
-
-    Returns:
-        {
-            "url_risk":  int  — risk points contributed by this URL,
-            "url_flags": list — human-readable flag strings,
-        }
+    Returns {"url_risk": int, "url_flags": list[str]}.
     """
-    risk  = 0
-    flags = []
-
+    risk   = 0
+    flags  = []
     domain = url_info["domain"].lower()
     suffix = url_info["suffix"].lower()
 
-    # ── Check 1: Suspicious TLD ───────────────────────────────────────────────
+    # Skip official known-good domains entirely
+    if domain in _OFFICIAL_DOMAINS:
+        return {"url_risk": 0, "url_flags": []}
+
+    # 1. Suspicious TLD
     if suffix in SUSPICIOUS_TLDS:
         risk += 25
-        flags.append(f"Uses suspicious domain suffix (.{suffix})")
+        flags.append(f"Suspicious domain extension: .{suffix}")
 
-    # ── Check 2: Brand impersonation (brand name + hyphen in domain) ──────────
-    for brand in KNOWN_BRANDS:
-        if brand in domain and "-" in domain:
+    # 2. Brand impersonation — brand keyword in a non-official domain
+    for brand in TRUSTED_BRANDS:
+        if brand in domain and domain != brand:
             risk += 30
-            flags.append(f"Possible impersonation of '{brand}'")
-            break  # one impersonation flag per URL is enough
+            flags.append(f"Possible brand impersonation: '{brand}' in domain")
+            break  # one impersonation flag per URL
 
-    # ── Check 3: Abnormally long domain ───────────────────────────────────────
-    if len(domain) > 20:
+    # 3. Hyphenated structure signals fake "secure" domains
+    hyphen_count = domain.count("-")
+    if hyphen_count >= 2:
+        risk += 15
+        flags.append(f"Heavily hyphenated domain structure ({hyphen_count} hyphens)")
+    elif hyphen_count == 1:
+        # Only flag single-hyphen if combined with a brand or suspicious TLD
+        if any(brand in domain for brand in TRUSTED_BRANDS) or suffix in SUSPICIOUS_TLDS:
+            risk += 10
+            flags.append("Hyphenated domain combined with brand/suspicious TLD")
+
+    # 4. Abnormally long domain
+    if len(domain) > 25:
         risk += 10
-        flags.append(f"Unusually long domain name ({len(domain)} chars)")
+        flags.append(f"Unusually long domain ({len(domain)} chars)")
 
-    return {
-        "url_risk":  risk,
-        "url_flags": flags,
-    }
+    return {"url_risk": risk, "url_flags": flags}
 
+# =============================================================================
+# ─── Keyword Detection Helper ────────────────────────────────────────────────
+# =============================================================================
 
-# ---------------------------------------------------------------------------
-# Core Function  (updated in Phase 3)
-# ---------------------------------------------------------------------------
+def detect_keywords(text: str) -> dict:
+    """
+    Scan text against all SCAM_PATTERNS.
+
+    Returns matched_categories and matched_keywords (both deduplicated).
+    """
+    lowered  = text.lower()
+    cats: List[str] = []
+    kws:  List[str] = []
+
+    for category, keywords in SCAM_PATTERNS.items():
+        for kw in keywords:
+            if kw in lowered:
+                if category not in cats:
+                    cats.append(category)
+                if kw not in kws:
+                    kws.append(kw)
+
+    return {"matched_categories": cats, "matched_keywords": kws}
+
+# =============================================================================
+# ─── Core Detection Function ─────────────────────────────────────────────────
+# =============================================================================
 
 def detect_phish(input_data: str) -> dict:
     """
-    Core detection function.
+    Multi-signal scam detection pipeline.
 
-    Pipeline:
-        1. Extract + parse URLs              (Phase 2)
-        2. Match scam keywords               (Phase 3)
-        3. Sum category weights + bonuses    (Phase 4)
-        4. Analyse each URL for domain risk  (Phase 5)
-        5. Merge URL risk into total score   (Phase 5)
-        6. Decide is_scam (score >= 40)      (Phase 4)
-        7. Build full explanation markdown   (Phase 4/5)
+    Layers:
+        L0  URL extraction + parsing
+        L1  Keyword matching → base score
+        L2  Combo boosts
+        L3  Linguistic signals
+        L4  Safe-pattern defence (score reduction)
+        L5  URL intelligence
+        ──  Threshold decision + output assembly
 
     Args:
-        input_data: Raw text or URL string to analyse.
+        input_data: Raw text or URL string.
 
     Returns:
-        A fully populated risk assessment dict.
+        Complete risk assessment dict.
     """
-    # ── Phase 2: URL extraction & parsing ────────────────────────────────────
+    lowered = input_data.lower()
+
+    # ── L0: URLs ──────────────────────────────────────────────────────────────
     detected_urls = extract_urls(input_data)
     url_analysis  = [parse_url(u) for u in detected_urls]
 
-    # ── Phase 3: Keyword + category matching ─────────────────────────────────
-    keyword_result     = detect_keywords(input_data)
-    matched_categories = keyword_result["matched_categories"]
-    matched_keywords   = keyword_result["matched_keywords"]
-    red_flags          = build_red_flags(matched_categories)
+    # ── L1: Keywords ─────────────────────────────────────────────────────────
+    kw_result          = detect_keywords(input_data)
+    matched_categories = kw_result["matched_categories"]
+    matched_keywords   = kw_result["matched_keywords"]
 
-    # ── Phase 4: Text-based risk scoring ─────────────────────────────────────
-    risk_score = 0
+    base_score = sum(SCAM_WEIGHTS.get(c, 10) for c in matched_categories)
 
-    for category in matched_categories:
-        risk_score += CATEGORY_WEIGHTS.get(category, 10)
+    # ── L2: Combo boosts ──────────────────────────────────────────────────────
+    combo_boost, combo_labels = apply_combo_boosts(set(matched_categories), lowered)
 
-    # Bonus for messages that combine multiple threat signals
-    if len(matched_categories) >= 2:
-        risk_score += 10
-    if len(matched_categories) >= 3:
-        risk_score += 10
+    # ── L3: Linguistic signals ────────────────────────────────────────────────
+    ling_boost, ling_signals = detect_linguistic_signals(input_data)
 
-    # ── Phase 5: URL-based risk scoring ──────────────────────────────────────
+    # ── L4: Safe patterns ─────────────────────────────────────────────────────
+    safe_reduction, safe_signals = detect_safe_signals(input_data)
+
+    # ── L5: URL intelligence ──────────────────────────────────────────────────
     url_risk_total = 0
-    url_flags_all  = []
+    url_risk_flags: List[str] = []
 
-    for url in url_analysis:
-        result = analyze_url_risk(url)
+    for url_info in url_analysis:
+        result = analyze_url_risk(url_info)
         url_risk_total += result["url_risk"]
-        url_flags_all.extend(result["url_flags"])
+        url_risk_flags.extend(result["url_flags"])
 
-    # Merge URL risk into the running total, then cap
-    risk_score += url_risk_total
-    risk_score  = min(risk_score, 100)
+    # ── Score assembly ────────────────────────────────────────────────────────
+    raw_score  = base_score + combo_boost + ling_boost + url_risk_total + safe_reduction
+    risk_score = max(0, min(100, raw_score))  # clamp [0, 100]
 
-    # Append URL flags into the unified red_flags list (deduplicated)
-    for flag in url_flags_all:
-        if flag not in red_flags:
-            red_flags.append(flag)
+    # ── Confidence: one signal = 10 pts, capped at 100 ───────────────────────
+    total_signals = (
+        len(matched_categories)
+        + len(combo_labels)
+        + len(ling_signals)
+        + len(url_risk_flags)
+        - len(safe_signals)            # safe patterns reduce confidence too
+    )
+    confidence_score = min(100, max(0, total_signals * 10))
 
-    # ── Phase 4: Decision ─────────────────────────────────────────────────────
-    is_scam = risk_score >= 40
-
-    # Primary category: highest-weight text category, or "url_scam" if only URL signals fired
-    if matched_categories:
-        final_category = max(matched_categories, key=lambda c: CATEGORY_WEIGHTS.get(c, 0))
-    elif url_flags_all:
-        final_category = "url_scam"
+    # ── Threshold decision ────────────────────────────────────────────────────
+    if risk_score >= 70:
+        status   = "scam"
+        is_scam  = True
+        impact   = "High risk of financial loss or identity theft."
+        action   = "Do NOT click any links or share any information. Block the sender."
+    elif risk_score >= 40:
+        status   = "suspicious"
+        is_scam  = False
+        impact   = "Potentially harmful — treat with caution."
+        action   = "Do not share personal information. Verify through official channels."
     else:
-        final_category = "safe"
+        status   = "safe"
+        is_scam  = False
+        impact   = "No significant threat detected."
+        action   = "No action required."
 
-    # ── Phase 4: Impact + Action ──────────────────────────────────────────────
-    if is_scam:
-        impact = "Potential financial loss or identity theft."
-        action = "Do NOT click any links or share sensitive information."
-    else:
-        impact = "Low risk."
-        action = "No immediate threat detected."
+    # ── Category labels ───────────────────────────────────────────────────────
+    primary_category = (
+        max(matched_categories, key=lambda c: SCAM_WEIGHTS.get(c, 0))
+        if matched_categories else ("url_scam" if url_risk_flags else "safe")
+    )
+    secondary_categories = [c for c in matched_categories if c != primary_category]
 
-    # ── Phase 4/5: Explanation markdown ──────────────────────────────────────
-    category_list = ", ".join(matched_categories) if matched_categories else "None"
-    keyword_list  = ", ".join(matched_keywords)   if matched_keywords   else "None"
-    flag_list     = "\n".join(f"- {f}" for f in red_flags) if red_flags else "- None"
+    # ── Red flags (unified) ───────────────────────────────────────────────────
+    red_flags: List[str] = []
 
-    explanation = f"""### Scam Analysis Result
+    for cat in matched_categories:
+        label = CATEGORY_FLAG_LABELS.get(cat)
+        if label and label not in red_flags:
+            red_flags.append(label)
 
+    for label in combo_labels + ling_signals + url_risk_flags:
+        if label not in red_flags:
+            red_flags.append(label)
+
+    # ── Explanation markdown ──────────────────────────────────────────────────
+    status_icon  = {"scam": "🚨", "suspicious": "🔶", "safe": "✅"}[status]
+    cat_list     = ", ".join(matched_categories)  if matched_categories  else "None"
+    kw_list      = ", ".join(matched_keywords)    if matched_keywords    else "None"
+    flag_block   = "\n".join(f"- {f}" for f in red_flags) if red_flags else "- None"
+
+    explanation  = f"""### PhishGuard Analysis Report
+
+**Status:** {status_icon} {status.upper()}  
 **Risk Score:** {risk_score}/100  
-**Decision:** {"⚠️ SCAM DETECTED" if is_scam else "✅ Likely Safe"}  
-**Primary Category:** {final_category.replace("_", " ").title()}  
-**Detected Categories:** {category_list}  
+**Confidence:** {confidence_score}%  
+**Primary Category:** {primary_category.replace("_", " ").title()}  
+**All Detected Categories:** {cat_list}  
 
-### Why this is flagged:
-{flag_list}
+---
 
-**Matched keywords:** {keyword_list}  
-**URLs found:** {len(detected_urls)}  
+### 🔍 Signals Triggered
+{flag_block}
 
-### Recommendation:
-{action}
+**Matched keywords:** {kw_list}  
+**URLs analysed:** {len(detected_urls)}  
+"""
 
-*Impact: {impact}*"""
+    if combo_labels:
+        explanation += "\n### ⚡ High-Risk Combinations\n"
+        explanation += "\n".join(f"- {l}" for l in combo_labels) + "\n"
 
-    # Append URL-specific risk section if any URL flags were raised
-    if url_flags_all:
-        url_flag_lines = "\n- ".join(url_flags_all)
-        explanation += f"\n\n### URL Risk Signals:\n- {url_flag_lines}"
+    if url_risk_flags:
+        explanation += "\n### 🌐 URL Risk Signals\n"
+        explanation += "\n".join(f"- {f}" for f in url_risk_flags) + "\n"
+
+    if safe_signals:
+        explanation += "\n### 🛡️ Safe Signals Detected (Score Reduced)\n"
+        explanation += "\n".join(f"- '{s}'" for s in safe_signals) + "\n"
+
+    explanation += f"""
+---
+
+### 📋 Recommendation
+**{action}**
+
+*Impact assessment: {impact}*"""
 
     # ── Final response ─────────────────────────────────────────────────────────
     return {
+        # ── Core (backward compatible) ────────────────────────────────────────
         "is_scam":              is_scam,
         "risk_score":           risk_score,
-        "category":             final_category,
+        "category":             primary_category,   # alias kept for compatibility
         "red_flags":            red_flags,
         "impact":               impact,
         "action":               action,
@@ -504,27 +609,32 @@ def detect_phish(input_data: str) -> dict:
         "url_analysis":         url_analysis,
         "matched_categories":   matched_categories,
         "matched_keywords":     matched_keywords,
+        # ── New v2 fields ─────────────────────────────────────────────────────
+        "status":               status,
+        "primary_category":     primary_category,
+        "secondary_categories": secondary_categories,
+        "confidence_score":     confidence_score,
+        "url_risk_flags":       url_risk_flags,
+        "safe_signals_detected": safe_signals,
     }
 
-
-# ---------------------------------------------------------------------------
-# API Routes  (unchanged)
-# ---------------------------------------------------------------------------
+# =============================================================================
+# API Routes
+# =============================================================================
 
 @app.get("/health", summary="Health check")
 def health_check():
-    """Returns service status. Use this to verify the API is running."""
-    return {"status": "ok"}
+    """Returns service liveness status."""
+    return {"status": "ok", "version": "2.0.0"}
 
 
 @app.post("/detect", summary="Analyse text or URL for phishing/scam signals")
 def detect(request: DetectRequest):
     """
-    Accepts a JSON body with `text` or `url` (or both), and an optional `language`.
+    Multi-signal scam analysis.
 
-    Returns the full technical analysis plus two localised user-facing fields:
-      - user_message : plain verdict in the requested language
-      - user_action  : plain safety instruction in the requested language
+    Body: { "text": "...", "url": "...", "language": "en|hi|mr" }
+    At least one of text / url is required.
     """
     if not request.text and not request.url:
         raise HTTPException(
@@ -533,34 +643,31 @@ def detect(request: DetectRequest):
         )
 
     input_data = request.text if request.text else request.url
-
-    # Resolve language template — fall back to English for unsupported codes
-    lang     = request.language if request.language in LANGUAGE_TEMPLATES else "en"
-    template = LANGUAGE_TEMPLATES[lang]
+    lang       = request.language if request.language in LANGUAGE_TEMPLATES else "en"
+    template   = LANGUAGE_TEMPLATES[lang]
 
     result = detect_phish(input_data)
 
-    # Inject localised fields into the response
-    result["user_message"] = template["scam"] if result["is_scam"] else template["safe"]
+    # Localised user-facing verdict
+    status = result["status"]
+    result["user_message"] = template.get(status, template["safe"])
     result["user_action"]  = template["action"]
 
     return result
 
-
-# ---------------------------------------------------------------------------
-# CLI Mode  (unchanged)
-# ---------------------------------------------------------------------------
+# =============================================================================
+# CLI
+# =============================================================================
 
 def run_cli():
-    """Interactive CLI: prompts for input and language, runs detect_phish(), prints result."""
-    print("=" * 50)
-    print("  PhishGuard CLI — Scam Detection Tool")
-    print("=" * 50)
-    print("Enter the text or URL you want to analyse.")
-    print("(Ctrl+C to quit)\n")
+    """Interactive CLI — prompts for input and language, prints verdict + JSON."""
+    print("=" * 55)
+    print("  PhishGuard v2.0 — Multi-Signal Scam Detection CLI")
+    print("=" * 55)
+    print("Enter text or a URL to analyse. (Ctrl+C to quit)\n")
 
     try:
-        user_input = input("Input : ").strip()
+        user_input = input("Input    : ").strip()
         lang_input = input("Language [en/hi/mr, default en]: ").strip() or "en"
     except (KeyboardInterrupt, EOFError):
         print("\nExiting.")
@@ -572,21 +679,22 @@ def run_cli():
 
     lang     = lang_input if lang_input in LANGUAGE_TEMPLATES else "en"
     template = LANGUAGE_TEMPLATES[lang]
+    result   = detect_phish(user_input)
 
-    result = detect_phish(user_input)
-    result["user_message"] = template["scam"] if result["is_scam"] else template["safe"]
+    status = result["status"]
+    result["user_message"] = template.get(status, template["safe"])
     result["user_action"]  = template["action"]
 
-    # Print the user-facing verdict prominently, then the full JSON
     print(f"\n{result['user_message']}")
+    print(f"Risk Score : {result['risk_score']}/100  |  Confidence : {result['confidence_score']}%")
+    print(f"Status     : {status.upper()}  |  Category : {result['primary_category']}")
     print(f"👉 {result['user_action']}\n")
-    print("--- Full Result ---")
+    print("─── Full JSON ───")
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
-
-# ---------------------------------------------------------------------------
+# =============================================================================
 # Entry Point
-# ---------------------------------------------------------------------------
+# =============================================================================
 
 if __name__ == "__main__":
     if "--serve" in sys.argv:
