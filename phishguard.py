@@ -1,26 +1,29 @@
 """
-PhishGuard v2.0 — Multi-Signal Scoring Engine
-==============================================
-Detection is layered:
+PhishGuard v2.0 — Multi-Signal Scoring Engine + Translation Layer
+=================================================================
+Architecture:
+  INPUT  → Normalize to English (if non-English detected)
+         → Detection runs on English text (rules + LLM)
+         → Translate user-facing output to selected language
+  OUTPUT → user_message + user_action in user's language
+           everything else stays English
 
-  Signal Layer 1 — Keyword matching       (per-category weighted scores)
-  Signal Layer 2 — Combo boost logic      (dangerous category combinations)
-  Signal Layer 3 — Linguistic signals     (imperative tone, urgency phrases)
-  Signal Layer 4 — Safe-pattern defence   (negation / awareness phrases)
-  Signal Layer 5 — URL intelligence       (TLD abuse, brand impersonation,
-                                           hyphenated fake domains,
-                                           URL shortener detection)
-  Signal Layer 6 — LLM second opinion     (fires on all scores < 61,
-                                           can escalate safe → suspicious)
+Signal Layers:
+  L0 — URL extraction & parsing
+  L1 — Keyword matching       (per-category weighted scores)
+  L2 — Combo boost logic      (dangerous category combinations)
+  L3 — Linguistic signals     (imperative tone, urgency phrases)
+  L4 — Safe-pattern defence   (negation / awareness phrases)
+  L5 — URL intelligence       (TLD abuse, brand impersonation,
+                                shortener detection)
+  L6 — LLM second opinion     (fires on all scores < 61,
+                                can escalate safe → suspicious)
+  L7 — Translation layer      (user_message + user_action only)
 
-Scoring thresholds (rule engine):
+Scoring thresholds:
   >= 70  → scam
   >= 40  → suspicious
   <  40  → safe
-
-LLM layer fires when risk_score < 61.
-LLM can escalate status to "suspicious" if it detects social engineering
-that the rule engine missed. It never downgrades a scam verdict.
 """
 import requests
 import os
@@ -42,7 +45,7 @@ load_dotenv()
 
 app = FastAPI(
     title="PhishGuard API",
-    description="Multi-signal phishing & scam detection engine",
+    description="Multi-signal phishing & scam detection engine with translation",
     version="2.0.0",
 )
 
@@ -55,28 +58,39 @@ app.add_middleware(
 )
 
 # =============================================================================
-# Language Templates
+# Language Map — 29 languages via LLM translation
 # =============================================================================
 
-LANGUAGE_TEMPLATES = {
-    "en": {
-        "scam":        "⚠️ This appears to be a scam.",
-        "suspicious":  "🔶 This message looks suspicious.",
-        "safe":        "✅ This looks safe.",
-        "action":      "Do not click any links or share sensitive information.",
-    },
-    "hi": {
-        "scam":        "⚠️ यह एक धोखाधड़ी लगती है।",
-        "suspicious":  "🔶 यह संदिग्ध लगता है।",
-        "safe":        "✅ यह सुरक्षित लगता है।",
-        "action":      "किसी भी लिंक पर क्लिक न करें या निजी जानकारी साझा न करें।",
-    },
-    "mr": {
-        "scam":        "⚠️ हे फसवणूक असू शकते.",
-        "suspicious":  "🔶 हे संशयास्पद वाटते.",
-        "safe":        "✅ हे सुरक्षित वाटते.",
-        "action":      "कोणत्याही लिंकवर क्लिक करू नका किंवा वैयक्तिक माहिती देऊ नका.",
-    },
+LANGUAGE_MAP = {
+    "en":  "English",
+    "hi":  "Hindi",
+    "mr":  "Marathi",
+    "bn":  "Bengali",
+    "te":  "Telugu",
+    "ta":  "Tamil",
+    "gu":  "Gujarati",
+    "kn":  "Kannada",
+    "ml":  "Malayalam",
+    "pa":  "Punjabi",
+    "or":  "Odia",
+    "as":  "Assamese",
+    "ur":  "Urdu",
+    "sa":  "Sanskrit",
+    "kok": "Konkani",
+    "mni": "Manipuri",
+    "ne":  "Nepali",
+    "mai": "Maithili",
+    "sd":  "Sindhi",
+    "sat": "Santali",
+    "brx": "Bodo",
+    "doi": "Dogri",
+    "raj": "Rajasthani",
+    "bho": "Bhojpuri",
+    "ks":  "Kashmiri",
+    "hne": "Chhattisgarhi",
+    "bgc": "Haryanvi",
+    "kha": "Khasi",
+    "lus": "Mizo",
 }
 
 # =============================================================================
@@ -89,21 +103,128 @@ class DetectRequest(BaseModel):
     language: Optional[str] = "en"
 
 # =============================================================================
-# ─── LLM LAYER (OpenRouter) ──────────────────────────────────────────────────
+# ─── INPUT NORMALIZATION ─────────────────────────────────────────────────────
+# =============================================================================
+
+def is_predominantly_non_english(text: str) -> bool:
+    """
+    Returns True if the text is likely non-English script
+    (Devanagari, Malayalam, Tamil, Telugu, Bengali, Gujarati, etc.)
+
+    Strategy: count characters outside basic ASCII + Latin extended range.
+    If more than 25% of alphabetic characters are non-Latin, treat as
+    non-English and translate before detection.
+    """
+    alpha_chars = [c for c in text if c.isalpha()]
+    if not alpha_chars:
+        return False
+    non_latin = sum(1 for c in alpha_chars if ord(c) > 0x024F)
+    return (non_latin / len(alpha_chars)) > 0.25
+
+
+def normalize_to_english(text: str) -> str:
+    """
+    Translate non-English input to English before running detection.
+
+    - URLs are explicitly preserved so rule engine can still analyze them.
+    - Original text is kept for output/translation back to user's language.
+    - On failure, returns original text (detection degrades gracefully).
+
+    This is called ONLY when is_predominantly_non_english() returns True.
+    """
+    api_url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
+        "Content-Type": "application/json"
+    }
+
+    prompt = f"""Translate the following text to English.
+
+Important rules:
+- Preserve ALL URLs exactly as they appear — do not change them
+- Preserve numbers, amounts (₹, $), and phone numbers exactly
+- Return ONLY the translated English text
+- No explanation, no quotes, no extra text
+
+Text:
+{text}"""
+
+    data = {
+        "model": "deepseek/deepseek-chat",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1
+    }
+
+    try:
+        res     = requests.post(api_url, headers=headers, json=data, timeout=10)
+        content = res.json()["choices"][0]["message"]["content"].strip()
+        print(f"[Normalization] Translated input: {content[:120]}...")
+        return content
+    except Exception as e:
+        print(f"[Normalization] Failed, using original: {e}")
+        return text  # Graceful fallback — detection still runs on original
+
+
+# =============================================================================
+# ─── OUTPUT TRANSLATION LAYER (L7) ───────────────────────────────────────────
+# =============================================================================
+
+def translate_text(text: str, target_lang_code: str) -> str:
+    """
+    Translate English output text to the user's selected language.
+
+    Called AFTER all detection is complete.
+    Only translates: user_message, user_action.
+    Never translates: risk_score, categories, red_flags, explanation_markdown.
+    """
+    target_lang = LANGUAGE_MAP.get(target_lang_code, "English")
+
+    api_url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
+        "Content-Type": "application/json"
+    }
+
+    prompt = f"""Translate the following text into {target_lang}.
+
+Keep it:
+- simple and clear
+- suitable for common Indian users who may not be tech-savvy
+- natural sounding, not robotic
+
+Return ONLY the translated text. No explanation, no quotes, no extra text.
+
+Text:
+{text}"""
+
+    data = {
+        "model": "deepseek/deepseek-chat",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2
+    }
+
+    try:
+        res     = requests.post(api_url, headers=headers, json=data, timeout=10)
+        content = res.json()["choices"][0]["message"]["content"]
+        return content.strip()
+    except Exception as e:
+        print(f"[Translation] Error ({target_lang_code}): {e}")
+        return text  # Graceful fallback — return English
+
+
+# =============================================================================
+# ─── LLM SECOND OPINION (L6) ─────────────────────────────────────────────────
 # =============================================================================
 
 def analyze_with_llm(text: str, rule_score: int) -> dict:
     """
-    Call OpenRouter LLM as a second opinion.
+    LLM second opinion on borderline messages.
+    Always receives English text (normalized if needed).
+    Fires on all scores < 61.
 
-    Fires on all messages where rule_score < 61.
-    The LLM receives the rule engine score as context so it can make
-    a calibrated judgment — especially for soft social engineering that
-    keyword rules miss.
-
-    Returns dict with keys: explanation, user_message, action, llm_verdict
-    llm_verdict is one of: "safe", "suspicious", "scam"
-    Returns None on failure — original response is kept unchanged.
+    Can escalate safe → suspicious.
+    Never downgrades scam verdicts.
+    Never changes risk_score or scored fields.
     """
     api_url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
@@ -113,7 +234,7 @@ def analyze_with_llm(text: str, rule_score: int) -> dict:
 
     prompt = f"""You are a cybersecurity expert specializing in scam detection for Indian users.
 
-A rule-based system has analysed the following message and gave it a risk score of {rule_score}/100.
+A rule-based system analysed the following message and gave it a risk score of {rule_score}/100.
 A score below 40 means the rules consider it safe. Your job is to act as a second opinion.
 
 Carefully check for these scam patterns that rules often miss:
@@ -143,22 +264,21 @@ Return ONLY valid JSON. No text outside the JSON block.
 
     try:
         response = requests.post(api_url, headers=headers, json=data, timeout=12)
-        result = response.json()
-        content = result["choices"][0]["message"]["content"].strip()
-        # Strip markdown fences if present
+        result   = response.json()
+        content  = result["choices"][0]["message"]["content"].strip()
         if content.startswith("```"):
             content = re.sub(r"^```[a-z]*\n?", "", content)
             content = re.sub(r"\n?```$", "", content.strip())
         parsed = json.loads(content)
         if not isinstance(parsed, dict):
             return None
-        # Validate verdict value
         if parsed.get("llm_verdict") not in ("safe", "suspicious", "scam"):
-            parsed["llm_verdict"] = "suspicious"  # safe default on bad output
+            parsed["llm_verdict"] = "suspicious"
         return parsed
     except Exception as e:
-        print("LLM Error:", e)
+        print(f"[LLM] Error: {e}")
         return None
+
 
 # =============================================================================
 # ─── SIGNAL LAYER 0: URL Helpers ─────────────────────────────────────────────
@@ -210,7 +330,6 @@ SCAM_PATTERNS = {
         "kyc expired", "update kyc",
         "reactivate account", "verify account", "verify your account",
         "unblock account", "suspicious activity",
-        # Soft social engineering
         "requires verification", "update your details",
         "confirm your details", "verify your details",
         "avoid restriction", "avoid temporary",
@@ -345,16 +464,16 @@ CATEGORY_FLAG_LABELS = {
 # =============================================================================
 
 COMBO_BOOSTS = [
-    ({"bank_scam", "urgency"},            None,      20, "Bank threat + urgency combined"),
-    ({"upi_scam"},                        "approve", 25, "UPI approve request — classic scam pattern"),
-    ({"prize_scam"},                      "fee",     20, "Prize + fee demand — advance fee scam"),
-    ({"prize_scam", "urgency"},           None,      25, "Prize claim + urgency — pressure scam"),
-    ({"otp_scam", "bank_scam"},           None,      15, "OTP + bank threat — credential phishing"),
-    ({"digital_arrest_scam", "urgency"},  None,      20, "Digital arrest + urgency — high-pressure scam"),
-    ({"utility_scam", "urgency"},         None,      20, "Utility threat + urgency — disconnection scam"),
-    ({"job_scam", "prize_scam"},          None,      15, "Job offer + prize language — classic job scam"),
-    ({"tax_scam", "upi_scam"},            None,      20, "Refund + UPI — refund phishing scam"),
-    ({"subscription_scam", "urgency"},    None,      15, "Subscription expiry + urgency — renewal scam"),
+    ({"bank_scam", "urgency"},           None,      20, "Bank threat + urgency combined"),
+    ({"upi_scam"},                       "approve", 25, "UPI approve request — classic scam pattern"),
+    ({"prize_scam"},                     "fee",     20, "Prize + fee demand — advance fee scam"),
+    ({"prize_scam", "urgency"},          None,      25, "Prize claim + urgency — pressure scam"),
+    ({"otp_scam", "bank_scam"},          None,      15, "OTP + bank threat — credential phishing"),
+    ({"digital_arrest_scam", "urgency"}, None,      20, "Digital arrest + urgency — high-pressure scam"),
+    ({"utility_scam", "urgency"},        None,      20, "Utility threat + urgency — disconnection scam"),
+    ({"job_scam", "prize_scam"},         None,      15, "Job offer + prize language — classic job scam"),
+    ({"tax_scam", "upi_scam"},           None,      20, "Refund + UPI — refund phishing scam"),
+    ({"subscription_scam", "urgency"},   None,      15, "Subscription expiry + urgency — renewal scam"),
 ]
 
 
@@ -391,7 +510,7 @@ def detect_linguistic_signals(text: str) -> tuple[int, List[str]]:
     signals = []
     lowered = text.lower()
 
-    imperatives = _IMPERATIVE_PATTERNS.findall(text)
+    imperatives        = _IMPERATIVE_PATTERNS.findall(text)
     unique_imperatives = list({v.lower() for v in imperatives})
     if len(unique_imperatives) >= 2:
         boost += 10
@@ -410,16 +529,11 @@ def detect_linguistic_signals(text: str) -> tuple[int, List[str]]:
 # =============================================================================
 
 SAFE_PATTERNS = [
-    "do not share otp",
-    "never share your otp",
-    "bank will never ask",
-    "never share your pin",
-    "do not share your pin",
-    "beware of fraud",
-    "this is a scam",
-    "report fraud",
-    "protect yourself",
-    "stay safe from",
+    "do not share otp", "never share your otp",
+    "bank will never ask", "never share your pin",
+    "do not share your pin", "beware of fraud",
+    "this is a scam", "report fraud",
+    "protect yourself", "stay safe from",
     "ओटीपी किसी से साझा न करें",
     "बैंक कभी नहीं मांगता",
     "धोखाधड़ी से सावधान",
@@ -452,7 +566,6 @@ _OFFICIAL_DOMAINS = {
     "icicibank", "axisbank", "paytm", "phonepe",
 }
 
-# URL shorteners — used to hide real phishing destinations
 _URL_SHORTENERS = {
     "bit.ly", "tinyurl", "t.co", "goo.gl", "ow.ly",
     "short.io", "rebrand.ly", "cutt.ly", "is.gd", "buff.ly",
@@ -522,15 +635,39 @@ def detect_keywords(text: str) -> dict:
 # ─── Core Detection Function ─────────────────────────────────────────────────
 # =============================================================================
 
-def detect_phish(input_data: str) -> dict:
-    lowered = input_data.lower()
+def detect_phish(input_data: str, language: str = "en") -> dict:
+    """
+    Full detection pipeline.
 
-    # ── L0: URLs ──────────────────────────────────────────────────────────────
-    detected_urls = extract_urls(input_data)
-    url_analysis  = [parse_url(u) for u in detected_urls]
+    Step 1 — Normalize: if input is non-English, translate to English first.
+              URLs are preserved. Original text kept for output.
+    Step 2 — Detect: all layers run on English text.
+    Step 3 — LLM: second opinion on borderline scores (< 61).
+    Step 4 — Translate: user_message + user_action → user's language.
 
-    # ── L1: Keywords ─────────────────────────────────────────────────────────
-    kw_result          = detect_keywords(input_data)
+    Args:
+        input_data: Raw text or URL from user (any language).
+        language:   Output language code. Default "en".
+    """
+
+    # ── Step 1: Input Normalization ───────────────────────────────────────────
+    # Always extract URLs from the ORIGINAL input — they must not be altered.
+    # Run all detection on the English-normalized version of the text.
+    detected_urls = extract_urls(input_data)  # from original, always
+
+    if is_predominantly_non_english(input_data):
+        print(f"[Normalization] Non-English input detected, translating to English...")
+        detection_text = normalize_to_english(input_data)
+    else:
+        detection_text = input_data
+
+    lowered = detection_text.lower()
+
+    # ── L0: URL analysis (on original URLs) ──────────────────────────────────
+    url_analysis = [parse_url(u) for u in detected_urls]
+
+    # ── L1: Keywords (on normalized English text) ─────────────────────────────
+    kw_result          = detect_keywords(detection_text)
     matched_categories = kw_result["matched_categories"]
     matched_keywords   = kw_result["matched_keywords"]
     base_score         = sum(SCAM_WEIGHTS.get(c, 10) for c in matched_categories)
@@ -539,10 +676,10 @@ def detect_phish(input_data: str) -> dict:
     combo_boost, combo_labels = apply_combo_boosts(set(matched_categories), lowered)
 
     # ── L3: Linguistic signals ────────────────────────────────────────────────
-    ling_boost, ling_signals = detect_linguistic_signals(input_data)
+    ling_boost, ling_signals = detect_linguistic_signals(detection_text)
 
     # ── L4: Safe patterns ─────────────────────────────────────────────────────
-    safe_reduction, safe_signals = detect_safe_signals(input_data)
+    safe_reduction, safe_signals = detect_safe_signals(detection_text)
 
     # ── L5: URL intelligence ──────────────────────────────────────────────────
     url_risk_total = 0
@@ -567,20 +704,23 @@ def detect_phish(input_data: str) -> dict:
 
     # ── Rule engine threshold decision ───────────────────────────────────────
     if risk_score >= 70:
-        status  = "scam"
-        is_scam = True
-        impact  = "High risk of financial loss or identity theft."
-        action  = "Do NOT click any links or share any information. Block the sender."
+        status       = "scam"
+        is_scam      = True
+        impact       = "High risk of financial loss or identity theft."
+        action       = "Do NOT click any links or share any information. Block the sender."
+        user_message = "⚠️ This appears to be a scam."
     elif risk_score >= 40:
-        status  = "suspicious"
-        is_scam = False
-        impact  = "Potentially harmful — treat with caution."
-        action  = "Do not share personal information. Verify through official channels."
+        status       = "suspicious"
+        is_scam      = False
+        impact       = "Potentially harmful — treat with caution."
+        action       = "Do not share personal information. Verify through official channels."
+        user_message = "🔶 This message looks suspicious."
     else:
-        status  = "safe"
-        is_scam = False
-        impact  = "No significant threat detected."
-        action  = "No action required."
+        status       = "safe"
+        is_scam      = False
+        impact       = "No significant threat detected."
+        action       = "No action required."
+        user_message = "✅ This looks safe."
 
     # ── Category labels ───────────────────────────────────────────────────────
     primary_category = (
@@ -641,6 +781,7 @@ def detect_phish(input_data: str) -> dict:
 
     # ── Build final response ──────────────────────────────────────────────────
     final_result = {
+        # Core detection fields — never translated
         "is_scam":               is_scam,
         "risk_score":            risk_score,
         "category":              primary_category,
@@ -658,42 +799,47 @@ def detect_phish(input_data: str) -> dict:
         "confidence_score":      confidence_score,
         "url_risk_flags":        url_risk_flags,
         "safe_signals_detected": safe_signals,
+        # User-facing fields (translated in L7 if needed)
+        "user_message":          user_message,
+        "user_action":           action,
     }
 
-    # ── SIGNAL LAYER 6: LLM Second Opinion ───────────────────────────────────
-    # Fires on ALL messages where the rule engine scored below 61.
-    # This catches soft social engineering, URL shortener scams, job scams,
-    # utility bill scams, and subscription scams that keywords miss.
-    #
-    # The LLM CAN:
-    #   - Escalate "safe" → "suspicious" if it finds social engineering
-    #   - Replace explanation, user_message, action with richer text
-    #
-    # The LLM CANNOT:
-    #   - Downgrade a scam verdict (score >= 70 skips LLM entirely)
-    #   - Change risk_score, is_scam, red_flags, or any scored field
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── L6: LLM Second Opinion ────────────────────────────────────────────────
+    # Always receives English text (normalized if input was non-English).
+    # Fires on all scores < 61. Can escalate safe → suspicious.
     if risk_score < 61:
-        llm_result = analyze_with_llm(input_data, risk_score)
+        llm_result = analyze_with_llm(detection_text, risk_score)
 
         if llm_result:
             llm_verdict = llm_result.get("llm_verdict", "safe")
 
-            # LLM escalation: safe → suspicious
             if status == "safe" and llm_verdict in ("suspicious", "scam"):
-                final_result["status"]       = "suspicious"
-                final_result["is_scam"]      = False
-                final_result["impact"]       = "Potentially harmful — treat with caution."
-                # Add LLM escalation to red flags for transparency
-                final_result["red_flags"].append("⚠️ AI analysis flagged this as suspicious despite low rule score")
+                final_result["status"]  = "suspicious"
+                final_result["is_scam"] = False
+                final_result["impact"]  = "Potentially harmful — treat with caution."
+                final_result["red_flags"].append(
+                    "⚠️ AI analysis flagged this as suspicious despite low rule score"
+                )
+                final_result["user_message"] = "🔶 This message looks suspicious."
 
-            # Always update explanation and user-facing text from LLM
             if "explanation" in llm_result:
                 final_result["explanation_markdown"] = llm_result["explanation"]
             if "user_message" in llm_result:
                 final_result["user_message"] = llm_result["user_message"]
             if "action" in llm_result:
-                final_result["action"] = llm_result["action"]
+                final_result["action"]      = llm_result["action"]
+                final_result["user_action"] = llm_result["action"]
+
+    # ── L7: Output Translation ────────────────────────────────────────────────
+    # Runs last, after all detection is finalized.
+    # Translates ONLY user_message and user_action.
+    if language != "en" and language in LANGUAGE_MAP:
+        final_result["user_message"] = translate_text(
+            final_result["user_message"], language
+        )
+        final_result["user_action"] = translate_text(
+            final_result["user_action"], language
+        )
 
     return final_result
 
@@ -703,11 +849,25 @@ def detect_phish(input_data: str) -> dict:
 
 @app.get("/health", summary="Health check")
 def health_check():
-    return {"status": "ok", "version": "2.0.0"}
+    return {
+        "status": "ok",
+        "version": "2.0.0",
+        "supported_languages": len(LANGUAGE_MAP),
+    }
 
 
 @app.post("/detect", summary="Analyse text or URL for phishing/scam signals")
 def detect(request: DetectRequest):
+    """
+    Multi-signal scam analysis with auto language normalization + translation.
+
+    Body: { "text": "...", "url": "...", "language": "en|hi|ml|ta|..." }
+    - text/url: at least one required (any language)
+    - language: output language code (default "en")
+
+    Non-English input is automatically translated to English for detection,
+    then the verdict is translated back to the user's selected language.
+    """
     if not request.text and not request.url:
         raise HTTPException(
             status_code=422,
@@ -715,16 +875,9 @@ def detect(request: DetectRequest):
         )
 
     input_data = request.text if request.text else request.url
-    lang       = request.language if request.language in LANGUAGE_TEMPLATES else "en"
-    template   = LANGUAGE_TEMPLATES[lang]
+    language   = request.language if request.language in LANGUAGE_MAP else "en"
 
-    result = detect_phish(input_data)
-
-    status = result["status"]
-    if "user_message" not in result:
-        result["user_message"] = template.get(status, template["safe"])
-    result["user_action"] = template["action"]
-
+    result = detect_phish(input_data, language)
     return result
 
 # =============================================================================
@@ -735,11 +888,12 @@ def run_cli():
     print("=" * 55)
     print("  PhishGuard v2.0 — Multi-Signal Scam Detection CLI")
     print("=" * 55)
-    print("Enter text or a URL to analyse. (Ctrl+C to quit)\n")
+    supported = ", ".join(sorted(LANGUAGE_MAP.keys()))
+    print(f"Supported language codes: {supported}\n")
 
     try:
         user_input = input("Input    : ").strip()
-        lang_input = input("Language [en/hi/mr, default en]: ").strip() or "en"
+        lang_input = input("Language [default: en]: ").strip() or "en"
     except (KeyboardInterrupt, EOFError):
         print("\nExiting.")
         return
@@ -748,18 +902,12 @@ def run_cli():
         print("No input provided. Exiting.")
         return
 
-    lang     = lang_input if lang_input in LANGUAGE_TEMPLATES else "en"
-    template = LANGUAGE_TEMPLATES[lang]
-    result   = detect_phish(user_input)
-
-    status = result["status"]
-    if "user_message" not in result:
-        result["user_message"] = template.get(status, template["safe"])
-    result["user_action"] = template["action"]
+    language = lang_input if lang_input in LANGUAGE_MAP else "en"
+    result   = detect_phish(user_input, language)
 
     print(f"\n{result['user_message']}")
     print(f"Risk Score : {result['risk_score']}/100  |  Confidence : {result['confidence_score']}%")
-    print(f"Status     : {status.upper()}  |  Category : {result['primary_category']}")
+    print(f"Status     : {result['status'].upper()}  |  Category : {result['primary_category']}")
     print(f"👉 {result['user_action']}\n")
     print("─── Full JSON ───")
     print(json.dumps(result, indent=2, ensure_ascii=False))
