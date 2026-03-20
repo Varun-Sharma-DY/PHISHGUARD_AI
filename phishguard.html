@@ -530,34 +530,64 @@ function HeroSection() {
 
 /* ── Language Selector ─────────────────────────────────────────────── */
 function LanguageSelector({ selected, onSelect }) {
-  const scrollRef = useRef(null);
-
-  useEffect(() => {
-    // Auto-scroll selected pill into view
-    const el = scrollRef.current;
-    if (!el) return;
-    const active = el.querySelector('.lang-pill.active');
-    if (active) active.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
-  }, [selected]);
-
   return (
     <div className="lang-section">
-      <div className="lang-label">Response Language</div>
-      <div className="lang-scroll-wrap">
-        <div className="lang-scroll" ref={scrollRef}>
+      <div className="input-label">Response Language</div>
+      <div style={{
+        position: 'relative',
+        maxWidth: '320px',
+      }}>
+        <select
+          value={selected}
+          onChange={e => onSelect(e.target.value)}
+          style={{
+            width: '100%',
+            appearance: 'none',
+            WebkitAppearance: 'none',
+            background: 'rgba(255,255,255,0.65)',
+            border: '1px solid rgba(100,180,220,0.3)',
+            borderRadius: '12px',
+            padding: '11px 44px 11px 16px',
+            fontFamily: "'DM Sans', sans-serif",
+            fontSize: '0.92rem',
+            fontWeight: '500',
+            color: 'var(--text)',
+            cursor: 'pointer',
+            backdropFilter: 'blur(20px)',
+            boxShadow: '0 2px 12px rgba(0,80,160,0.08)',
+            outline: 'none',
+            transition: 'border-color 0.2s, box-shadow 0.2s',
+          }}
+          onFocus={e => {
+            e.target.style.borderColor = 'rgba(77,143,255,0.45)';
+            e.target.style.boxShadow = '0 0 0 3px rgba(77,143,255,0.10), 0 4px 16px rgba(0,0,0,0.12)';
+          }}
+          onBlur={e => {
+            e.target.style.borderColor = 'rgba(100,180,220,0.3)';
+            e.target.style.boxShadow = '0 2px 12px rgba(0,80,160,0.08)';
+          }}
+        >
           {ALL_LANGUAGES.map(lang => (
-            <button
-              key={lang.code}
-              className={`lang-pill${selected === lang.code ? ' active' : ''}${!lang.supported ? ' coming-soon' : ''}`}
-              onClick={() => onSelect(lang.code)}
-              title={!lang.supported ? 'Coming soon — defaults to English' : lang.label}
-            >
-              {lang.label}
-              <span style={{ opacity: 0.6, marginLeft: 5, fontSize: '0.7rem' }}>{lang.native}</span>
-            </button>
+            <option key={lang.code} value={lang.code}>
+              {lang.native}{lang.supported ? '' : ' ·'}
+            </option>
           ))}
-        </div>
+        </select>
+        {/* Custom chevron */}
+        <div style={{
+          position: 'absolute', right: '14px', top: '50%',
+          transform: 'translateY(-50%)',
+          pointerEvents: 'none', color: 'var(--accent)', fontSize: '0.75rem',
+        }}>▾</div>
       </div>
+      {!ALL_LANGUAGES.find(l => l.code === selected)?.supported && (
+        <div style={{
+          marginTop: '8px', fontSize: '0.7rem',
+          color: 'var(--text-muted)', letterSpacing: '0.05em',
+        }}>
+          ↳ This language isn't supported yet — defaulting to English
+        </div>
+      )}
     </div>
   );
 }
