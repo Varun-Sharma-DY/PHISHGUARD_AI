@@ -47,3 +47,12 @@ PhishGuard_AI/
 ├── .venv/          ← created in Step 2
 ├── Phishguard.py   ← your backend
 └── phishguard.html ← your frontend (index.html also works)
+
+
+GIT PUSH 
+
+git add .
+
+git commit -m "your message here"
+
+git push

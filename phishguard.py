@@ -2,9 +2,9 @@
 PhishGuard v2.0 — Multi-Signal Scoring Engine + Translation Layer
 =================================================================
 Architecture:
-  INPUT  → Normalize to English (if non-English detected)
+  INPUT  → Normalize to English via googletrans (if non-English detected)
          → Detection runs on English text (rules + LLM)
-         → Translate user-facing output to selected language
+         → Translate user-facing output via googletrans to selected language
   OUTPUT → user_message + user_action in user's language
            everything else stays English
 
@@ -18,7 +18,8 @@ Signal Layers:
                                 shortener detection)
   L6 — LLM second opinion     (fires on all scores < 61,
                                 can escalate safe → suspicious)
-  L7 — Translation layer      (user_message + user_action only)
+  L7 — Translation layer      (user_message + user_action only,
+                                via googletrans)
 
 Scoring thresholds:
   >= 70  → scam
@@ -36,6 +37,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
+from googletrans import Translator
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -58,7 +60,14 @@ app.add_middleware(
 )
 
 # =============================================================================
-# Language Map — 29 languages via LLM translation
+# Translator (googletrans — single shared instance)
+# =============================================================================
+
+translator = Translator()
+
+# =============================================================================
+# Language Map — 29 languages
+# Keys match googletrans language codes exactly.
 # =============================================================================
 
 LANGUAGE_MAP = {
@@ -103,113 +112,76 @@ class DetectRequest(BaseModel):
     language: Optional[str] = "en"
 
 # =============================================================================
-# ─── INPUT NORMALIZATION ─────────────────────────────────────────────────────
+# ─── TRANSLATION HELPERS (googletrans) ───────────────────────────────────────
 # =============================================================================
+
+def translate_text(text: str, target_lang: str) -> str:
+    """
+    Translate text to target language using googletrans.
+
+    Used for:
+      - L7 output translation: user_message + user_action → user's language
+      - Input normalization: any language → English before detection
+
+    Falls back to original text on any failure.
+    """
+    try:
+        translated = translator.translate(text, dest=target_lang)
+        return translated.text
+    except Exception as e:
+        print(f"[Translation] Error ({target_lang}): {e}")
+        return text  # Graceful fallback — return original
+
 
 def is_predominantly_non_english(text: str) -> bool:
     """
-    Returns True if the text is likely non-English script
-    (Devanagari, Malayalam, Tamil, Telugu, Bengali, Gujarati, etc.)
-
-    Strategy: count characters outside basic ASCII + Latin extended range.
-    If more than 25% of alphabetic characters are non-Latin, treat as
-    non-English and translate before detection.
+    Returns True if > 25% of alphabetic characters are non-Latin script.
+    Covers Devanagari, Malayalam, Tamil, Telugu, Bengali, Gujarati, etc.
+    Zero API calls — pure character range check.
     """
     alpha_chars = [c for c in text if c.isalpha()]
     if not alpha_chars:
         return False
     non_latin = sum(1 for c in alpha_chars if ord(c) > 0x024F)
-    return (non_latin / len(alpha_chars)) > 0.25
+    ratio = non_latin / len(alpha_chars)
+    print(f"[Normalization] Script ratio: {ratio:.2f} ({non_latin}/{len(alpha_chars)} non-Latin)")
+    return ratio > 0.25
 
 
 def normalize_to_english(text: str) -> str:
     """
     Translate non-English input to English before running detection.
 
-    - URLs are explicitly preserved so rule engine can still analyze them.
-    - Original text is kept for output/translation back to user's language.
-    - On failure, returns original text (detection degrades gracefully).
+    Strategy:
+    - Extract all URLs from original text first
+    - Translate the full text to English via googletrans
+    - If translation fails, fall back to original (LLM will still run)
 
-    This is called ONLY when is_predominantly_non_english() returns True.
+    URLs survive translation because googletrans generally preserves them,
+    but we re-inject them from the original as a safety measure.
     """
-    api_url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
-        "Content-Type": "application/json"
-    }
+    print("[Normalization] Translating input to English via googletrans...")
 
-    prompt = f"""Translate the following text to English.
+    # Extract URLs before translation so we can verify they survive
+    original_urls = extract_urls(text)
 
-Important rules:
-- Preserve ALL URLs exactly as they appear — do not change them
-- Preserve numbers, amounts (₹, $), and phone numbers exactly
-- Return ONLY the translated English text
-- No explanation, no quotes, no extra text
+    translated = translate_text(text, "en")
 
-Text:
-{text}"""
+    if translated == text:
+        # translate_text returned original — translation failed
+        print("[Normalization] ❌ Translation returned original, using as-is")
+        return text
 
-    data = {
-        "model": "deepseek/deepseek-chat",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.1
-    }
+    print(f"[Normalization] ✅ Result: {translated[:120]}...")
 
-    try:
-        res     = requests.post(api_url, headers=headers, json=data, timeout=10)
-        content = res.json()["choices"][0]["message"]["content"].strip()
-        print(f"[Normalization] Translated input: {content[:120]}...")
-        return content
-    except Exception as e:
-        print(f"[Normalization] Failed, using original: {e}")
-        return text  # Graceful fallback — detection still runs on original
+    # Safety check: re-inject any URLs that didn't survive translation
+    translated_urls = extract_urls(translated)
+    missing_urls    = [u for u in original_urls if u not in translated_urls]
+    if missing_urls:
+        print(f"[Normalization] Re-injecting {len(missing_urls)} missing URL(s)")
+        translated = translated + " " + " ".join(missing_urls)
 
-
-# =============================================================================
-# ─── OUTPUT TRANSLATION LAYER (L7) ───────────────────────────────────────────
-# =============================================================================
-
-def translate_text(text: str, target_lang_code: str) -> str:
-    """
-    Translate English output text to the user's selected language.
-
-    Called AFTER all detection is complete.
-    Only translates: user_message, user_action.
-    Never translates: risk_score, categories, red_flags, explanation_markdown.
-    """
-    target_lang = LANGUAGE_MAP.get(target_lang_code, "English")
-
-    api_url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
-        "Content-Type": "application/json"
-    }
-
-    prompt = f"""Translate the following text into {target_lang}.
-
-Keep it:
-- simple and clear
-- suitable for common Indian users who may not be tech-savvy
-- natural sounding, not robotic
-
-Return ONLY the translated text. No explanation, no quotes, no extra text.
-
-Text:
-{text}"""
-
-    data = {
-        "model": "deepseek/deepseek-chat",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2
-    }
-
-    try:
-        res     = requests.post(api_url, headers=headers, json=data, timeout=10)
-        content = res.json()["choices"][0]["message"]["content"]
-        return content.strip()
-    except Exception as e:
-        print(f"[Translation] Error ({target_lang_code}): {e}")
-        return text  # Graceful fallback — return English
+    return translated
 
 
 # =============================================================================
@@ -218,14 +190,13 @@ Text:
 
 def analyze_with_llm(text: str, rule_score: int) -> dict:
     """
-    LLM second opinion on borderline messages.
-    Always receives English text (normalized if needed).
+    LLM second opinion via OpenRouter.
+    Always receives English text (normalized if input was non-English).
     Fires on all scores < 61.
-
-    Can escalate safe → suspicious.
-    Never downgrades scam verdicts.
-    Never changes risk_score or scored fields.
+    Can escalate safe → suspicious. Never downgrades scam verdicts.
     """
+    print(f"[LLM] Running second opinion (rule_score={rule_score})...")
+
     api_url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
@@ -239,10 +210,10 @@ A score below 40 means the rules consider it safe. Your job is to act as a secon
 
 Carefully check for these scam patterns that rules often miss:
 - URL shorteners (bit.ly, tinyurl, etc.) hiding real phishing destinations
-- Fake urgency: "pay now", "avoid disconnection", "expires today"
+- Fake urgency: "pay now", "avoid disconnection", "expires today", "blocked in 24 hours"
 - Impersonation of banks, government, electricity boards, job portals, UPI
 - Requests to click a link and enter personal or financial details
-- Too-good-to-be-true offers: jobs, refunds, prizes
+- Too-good-to-be-true offers: jobs, refunds, prizes, lucky draws
 - Subscription renewal or utility bill scams
 
 Message to analyse:
@@ -264,19 +235,35 @@ Return ONLY valid JSON. No text outside the JSON block.
 
     try:
         response = requests.post(api_url, headers=headers, json=data, timeout=12)
-        result   = response.json()
-        content  = result["choices"][0]["message"]["content"].strip()
+        response.raise_for_status()
+        content = response.json()["choices"][0]["message"]["content"].strip()
+
+        # Strip markdown fences if present
         if content.startswith("```"):
             content = re.sub(r"^```[a-z]*\n?", "", content)
             content = re.sub(r"\n?```$", "", content.strip())
+
         parsed = json.loads(content)
         if not isinstance(parsed, dict):
+            print("[LLM] ❌ Response was not a dict")
             return None
-        if parsed.get("llm_verdict") not in ("safe", "suspicious", "scam"):
+
+        verdict = parsed.get("llm_verdict", "")
+        if verdict not in ("safe", "suspicious", "scam"):
+            print(f"[LLM] ⚠️ Invalid verdict '{verdict}', defaulting to suspicious")
             parsed["llm_verdict"] = "suspicious"
+
+        print(f"[LLM] ✅ Verdict: {parsed['llm_verdict']}")
         return parsed
+
+    except requests.exceptions.Timeout:
+        print("[LLM] ❌ Request timed out")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"[LLM] ❌ JSON parse error: {e}")
+        return None
     except Exception as e:
-        print(f"[LLM] Error: {e}")
+        print(f"[LLM] ❌ Error: {e}")
         return None
 
 
@@ -346,6 +333,7 @@ SCAM_PATTERNS = {
         "pay immediately", "avoid disconnection",
         "will be interrupted", "interrupted today",
         "without interruption", "service will be",
+        "blocked in 24", "blocked within",
         "तुरंत", "अभी करें", "जल्दी करें", "अंतिम मौका",
         "24 घंटे में", "अभी क्लिक करें",
     ],
@@ -639,31 +627,32 @@ def detect_phish(input_data: str, language: str = "en") -> dict:
     """
     Full detection pipeline.
 
-    Step 1 — Normalize: if input is non-English, translate to English first.
-              URLs are preserved. Original text kept for output.
-    Step 2 — Detect: all layers run on English text.
-    Step 3 — LLM: second opinion on borderline scores (< 61).
-    Step 4 — Translate: user_message + user_action → user's language.
+    Step 1 — Normalize: non-English input → English via googletrans.
+              URLs extracted from original first, re-injected if lost.
+    Step 2 — Detect: all rule layers run on English text.
+    Step 3 — LLM: second opinion on scores < 61 (English text).
+    Step 4 — Translate: user_message + user_action → user's language
+              via googletrans.
 
     Args:
         input_data: Raw text or URL from user (any language).
-        language:   Output language code. Default "en".
+        language:   Output language code (e.g. "ml", "hi"). Default "en".
     """
 
     # ── Step 1: Input Normalization ───────────────────────────────────────────
-    # Always extract URLs from the ORIGINAL input — they must not be altered.
-    # Run all detection on the English-normalized version of the text.
-    detected_urls = extract_urls(input_data)  # from original, always
+    # URLs are always extracted from the ORIGINAL input before translation.
+    # Detection then runs on the English-normalized text.
+    detected_urls = extract_urls(input_data)  # always from original
 
     if is_predominantly_non_english(input_data):
-        print(f"[Normalization] Non-English input detected, translating to English...")
+        print("[Normalization] Non-English input detected, translating to English...")
         detection_text = normalize_to_english(input_data)
     else:
         detection_text = input_data
 
     lowered = detection_text.lower()
 
-    # ── L0: URL analysis (on original URLs) ──────────────────────────────────
+    # ── L0: URL analysis (always on original URLs) ────────────────────────────
     url_analysis = [parse_url(u) for u in detected_urls]
 
     # ── L1: Keywords (on normalized English text) ─────────────────────────────
@@ -799,20 +788,22 @@ def detect_phish(input_data: str, language: str = "en") -> dict:
         "confidence_score":      confidence_score,
         "url_risk_flags":        url_risk_flags,
         "safe_signals_detected": safe_signals,
-        # User-facing fields (translated in L7 if needed)
+        # User-facing fields — translated in L7 if language != "en"
         "user_message":          user_message,
         "user_action":           action,
     }
 
     # ── L6: LLM Second Opinion ────────────────────────────────────────────────
-    # Always receives English text (normalized if input was non-English).
+    # Always receives English (detection_text, normalized if needed).
     # Fires on all scores < 61. Can escalate safe → suspicious.
+    # Never changes risk_score, is_scam, red_flags, or scored fields.
     if risk_score < 61:
         llm_result = analyze_with_llm(detection_text, risk_score)
 
         if llm_result:
             llm_verdict = llm_result.get("llm_verdict", "safe")
 
+            # Escalate: safe → suspicious if LLM catches social engineering
             if status == "safe" and llm_verdict in ("suspicious", "scam"):
                 final_result["status"]  = "suspicious"
                 final_result["is_scam"] = False
@@ -830,10 +821,12 @@ def detect_phish(input_data: str, language: str = "en") -> dict:
                 final_result["action"]      = llm_result["action"]
                 final_result["user_action"] = llm_result["action"]
 
-    # ── L7: Output Translation ────────────────────────────────────────────────
-    # Runs last, after all detection is finalized.
+    # ── L7: Output Translation (googletrans) ──────────────────────────────────
+    # Runs last, after all detection and LLM are finalized.
     # Translates ONLY user_message and user_action.
+    # All scored/analytical fields remain in English permanently.
     if language != "en" and language in LANGUAGE_MAP:
+        print(f"[L7] Translating output to '{language}'...")
         final_result["user_message"] = translate_text(
             final_result["user_message"], language
         )
@@ -862,10 +855,10 @@ def detect(request: DetectRequest):
     Multi-signal scam analysis with auto language normalization + translation.
 
     Body: { "text": "...", "url": "...", "language": "en|hi|ml|ta|..." }
-    - text/url: at least one required (any language)
-    - language: output language code (default "en")
+    - text/url : at least one required (any language)
+    - language : output language code (default "en")
 
-    Non-English input is automatically translated to English for detection,
+    Non-English input is auto-translated to English for detection,
     then the verdict is translated back to the user's selected language.
     """
     if not request.text and not request.url:
