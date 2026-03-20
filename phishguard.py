@@ -1,10 +1,11 @@
 """
-PhishGuard v2.0 — Multi-Signal Scoring Engine + Translation Layer
-=================================================================
+PhishGuard v2.0 — Multi-Signal Scoring Engine + Translation + Caching
+======================================================================
 Architecture:
-  INPUT  → Normalize to English via googletrans (if non-English detected)
+  INPUT  → Check detection cache first
+         → Normalize to English via googletrans (if non-English detected)
          → Detection runs on English text (rules + LLM)
-         → Translate user-facing output via googletrans to selected language
+         → Translate user-facing output via googletrans (with cache)
   OUTPUT → user_message + user_action in user's language
            everything else stays English
 
@@ -15,11 +16,16 @@ Signal Layers:
   L3 — Linguistic signals     (imperative tone, urgency phrases)
   L4 — Safe-pattern defence   (negation / awareness phrases)
   L5 — URL intelligence       (TLD abuse, brand impersonation,
-                                shortener detection)
+                                shortener detection) [URL-level cache]
   L6 — LLM second opinion     (fires on all scores < 61,
                                 can escalate safe → suspicious)
   L7 — Translation layer      (user_message + user_action only,
-                                via googletrans)
+                                via googletrans) [translation cache]
+
+Caching:
+  detection results  → 1 hour   (cache key: detect:<normalized_text>)
+  URL risk results   → 1 hour   (cache key: url:<normalized_url>)
+  translations       → 24 hours (cache key: translate:<text>:<lang>)
 
 Scoring thresholds:
   >= 70  → scam
@@ -39,6 +45,21 @@ from pydantic import BaseModel
 from typing import Optional, List
 from googletrans import Translator
 from dotenv import load_dotenv
+
+# Import caching layer
+from cache import (
+    init_cache,
+    get_cache,
+    set_cache,
+    normalize_url,
+    normalize_text,
+    cleanup_cache,
+    cache_stats,
+    CACHE_TTL_DETECTION,
+    CACHE_TTL_TRANSLATE,
+    CACHE_TTL_URL,
+)
+
 load_dotenv()
 
 # =============================================================================
@@ -47,7 +68,7 @@ load_dotenv()
 
 app = FastAPI(
     title="PhishGuard API",
-    description="Multi-signal phishing & scam detection engine with translation",
+    description="Multi-signal phishing & scam detection engine with caching + translation",
     version="2.0.0",
 )
 
@@ -60,6 +81,16 @@ app.add_middleware(
 )
 
 # =============================================================================
+# Startup — initialize cache DB
+# =============================================================================
+
+@app.on_event("startup")
+def startup_event():
+    init_cache()
+    # Clean up entries older than 24 hours on every startup
+    cleanup_cache(ttl=86400)
+
+# =============================================================================
 # Translator (googletrans — single shared instance)
 # =============================================================================
 
@@ -67,7 +98,6 @@ translator = Translator()
 
 # =============================================================================
 # Language Map — 29 languages
-# Keys match googletrans language codes exactly.
 # =============================================================================
 
 LANGUAGE_MAP = {
@@ -112,22 +142,38 @@ class DetectRequest(BaseModel):
     language: Optional[str] = "en"
 
 # =============================================================================
-# ─── TRANSLATION HELPERS (googletrans) ───────────────────────────────────────
+# ─── TRANSLATION HELPERS (googletrans + cache) ────────────────────────────────
 # =============================================================================
 
 def translate_text(text: str, target_lang: str) -> str:
     """
-    Translate text to target language using googletrans.
+    Translate text to target language via googletrans.
+    Results are cached for 24 hours to avoid redundant API calls.
 
     Used for:
-      - L7 output translation: user_message + user_action → user's language
+      - L7 output: user_message + user_action → user's language
       - Input normalization: any language → English before detection
-
-    Falls back to original text on any failure.
     """
+    # Skip translation if already in target language
+    if target_lang == "en" and not is_predominantly_non_english(text):
+        return text
+
+    cache_key = f"translate:{normalize_text(text)}:{target_lang}"
+
+    # 1. Check cache first
+    cached = get_cache(cache_key, CACHE_TTL_TRANSLATE)
+    if cached:
+        print(f"[Translation] Cache HIT ({target_lang})")
+        return cached
+
+    # 2. Call googletrans
     try:
         translated = translator.translate(text, dest=target_lang)
-        return translated.text
+        result     = translated.text
+        # 3. Store in cache
+        set_cache(cache_key, result)
+        print(f"[Translation] Cache MISS → translated to '{target_lang}'")
+        return result
     except Exception as e:
         print(f"[Translation] Error ({target_lang}): {e}")
         return text  # Graceful fallback — return original
@@ -136,14 +182,13 @@ def translate_text(text: str, target_lang: str) -> str:
 def is_predominantly_non_english(text: str) -> bool:
     """
     Returns True if > 25% of alphabetic characters are non-Latin script.
-    Covers Devanagari, Malayalam, Tamil, Telugu, Bengali, Gujarati, etc.
     Zero API calls — pure character range check.
     """
     alpha_chars = [c for c in text if c.isalpha()]
     if not alpha_chars:
         return False
     non_latin = sum(1 for c in alpha_chars if ord(c) > 0x024F)
-    ratio = non_latin / len(alpha_chars)
+    ratio     = non_latin / len(alpha_chars)
     print(f"[Normalization] Script ratio: {ratio:.2f} ({non_latin}/{len(alpha_chars)} non-Latin)")
     return ratio > 0.25
 
@@ -151,30 +196,22 @@ def is_predominantly_non_english(text: str) -> bool:
 def normalize_to_english(text: str) -> str:
     """
     Translate non-English input to English before running detection.
+    Uses the same cached translate_text() function.
 
-    Strategy:
-    - Extract all URLs from original text first
-    - Translate the full text to English via googletrans
-    - If translation fails, fall back to original (LLM will still run)
-
-    URLs survive translation because googletrans generally preserves them,
-    but we re-inject them from the original as a safety measure.
+    URLs extracted from original are re-injected if lost in translation.
     """
-    print("[Normalization] Translating input to English via googletrans...")
-
-    # Extract URLs before translation so we can verify they survive
+    print("[Normalization] Translating input to English...")
     original_urls = extract_urls(text)
 
     translated = translate_text(text, "en")
 
     if translated == text:
-        # translate_text returned original — translation failed
-        print("[Normalization] ❌ Translation returned original, using as-is")
+        print("[Normalization] ⚠️ Translation returned original, using as-is")
         return text
 
     print(f"[Normalization] ✅ Result: {translated[:120]}...")
 
-    # Safety check: re-inject any URLs that didn't survive translation
+    # Safety: re-inject any URLs that didn't survive translation
     translated_urls = extract_urls(translated)
     missing_urls    = [u for u in original_urls if u not in translated_urls]
     if missing_urls:
@@ -194,6 +231,9 @@ def analyze_with_llm(text: str, rule_score: int) -> dict:
     Always receives English text (normalized if input was non-English).
     Fires on all scores < 61.
     Can escalate safe → suspicious. Never downgrades scam verdicts.
+
+    Note: LLM responses are NOT cached — they are context-sensitive
+    and depend on rule_score which can vary.
     """
     print(f"[LLM] Running second opinion (rule_score={rule_score})...")
 
@@ -236,9 +276,8 @@ Return ONLY valid JSON. No text outside the JSON block.
     try:
         response = requests.post(api_url, headers=headers, json=data, timeout=12)
         response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"].strip()
+        content  = response.json()["choices"][0]["message"]["content"].strip()
 
-        # Strip markdown fences if present
         if content.startswith("```"):
             content = re.sub(r"^```[a-z]*\n?", "", content)
             content = re.sub(r"\n?```$", "", content.strip())
@@ -541,7 +580,7 @@ def detect_safe_signals(text: str) -> tuple[int, List[str]]:
     return reduction, matched
 
 # =============================================================================
-# ─── SIGNAL LAYER 5: URL Intelligence ────────────────────────────────────────
+# ─── SIGNAL LAYER 5: URL Intelligence (with cache) ───────────────────────────
 # =============================================================================
 
 SUSPICIOUS_TLDS = {"xyz", "top", "gq", "tk", "ml", "cf", "click", "zip", "work", "ru"}
@@ -562,6 +601,21 @@ _URL_SHORTENERS = {
 
 
 def analyze_url_risk(url_info: dict) -> dict:
+    """
+    Score a single parsed URL.
+    Results are cached per URL for 1 hour — same URL appearing in
+    multiple messages won't rerun the analysis.
+    """
+    full_url    = url_info["full_url"]
+    cache_key   = f"url:{normalize_url(full_url)}"
+
+    # 1. Check URL-level cache
+    cached = get_cache(cache_key, CACHE_TTL_URL)
+    if cached:
+        print(f"[URL Cache] HIT: {full_url[:60]}")
+        return cached
+
+    # 2. Run analysis
     risk        = 0
     flags       = []
     domain      = url_info["domain"].lower()
@@ -569,7 +623,9 @@ def analyze_url_risk(url_info: dict) -> dict:
     full_domain = f"{domain}.{suffix}"
 
     if domain in _OFFICIAL_DOMAINS:
-        return {"url_risk": 0, "url_flags": []}
+        result = {"url_risk": 0, "url_flags": []}
+        set_cache(cache_key, result)
+        return result
 
     if suffix in SUSPICIOUS_TLDS:
         risk += 25
@@ -598,7 +654,12 @@ def analyze_url_risk(url_info: dict) -> dict:
         risk += 20
         flags.append(f"URL shortener detected ({full_domain}) — real destination is hidden")
 
-    return {"url_risk": risk, "url_flags": flags}
+    result = {"url_risk": risk, "url_flags": flags}
+
+    # 3. Cache the result
+    set_cache(cache_key, result)
+    print(f"[URL Cache] MISS → cached: {full_url[:60]}")
+    return result
 
 # =============================================================================
 # ─── Keyword Detection Helper ────────────────────────────────────────────────
@@ -625,23 +686,30 @@ def detect_keywords(text: str) -> dict:
 
 def detect_phish(input_data: str, language: str = "en") -> dict:
     """
-    Full detection pipeline.
+    Full detection pipeline with caching at three levels:
 
-    Step 1 — Normalize: non-English input → English via googletrans.
-              URLs extracted from original first, re-injected if lost.
-    Step 2 — Detect: all rule layers run on English text.
-    Step 3 — LLM: second opinion on scores < 61 (English text).
-    Step 4 — Translate: user_message + user_action → user's language
-              via googletrans.
+      1. Detection cache   — full result cached by normalized input text
+      2. URL cache         — per-URL risk analysis cached separately
+      3. Translation cache — user_message + user_action cached per lang
 
     Args:
-        input_data: Raw text or URL from user (any language).
-        language:   Output language code (e.g. "ml", "hi"). Default "en".
+        input_data: Raw text or URL (any language).
+        language:   Output language code. Default "en".
     """
 
+    # ── Detection Cache Check ─────────────────────────────────────────────────
+    # Cache key is based on normalized input text + language so the same
+    # message in different languages gets separate translated results.
+    detect_cache_key = f"detect:{normalize_text(input_data)}:{language}"
+
+    cached_result = get_cache(detect_cache_key, CACHE_TTL_DETECTION)
+    if cached_result:
+        print(f"[Detection Cache] HIT — skipping full pipeline")
+        return cached_result
+
+    print(f"[Detection Cache] MISS — running full pipeline")
+
     # ── Step 1: Input Normalization ───────────────────────────────────────────
-    # URLs are always extracted from the ORIGINAL input before translation.
-    # Detection then runs on the English-normalized text.
     detected_urls = extract_urls(input_data)  # always from original
 
     if is_predominantly_non_english(input_data):
@@ -652,10 +720,17 @@ def detect_phish(input_data: str, language: str = "en") -> dict:
 
     lowered = detection_text.lower()
 
-    # ── L0: URL analysis (always on original URLs) ────────────────────────────
-    url_analysis = [parse_url(u) for u in detected_urls]
+    # ── L0: URL analysis (cached per URL) ─────────────────────────────────────
+    url_analysis   = [parse_url(u) for u in detected_urls]
+    url_risk_total = 0
+    url_risk_flags: List[str] = []
 
-    # ── L1: Keywords (on normalized English text) ─────────────────────────────
+    for url_info in url_analysis:
+        result = analyze_url_risk(url_info)   # ← cached internally
+        url_risk_total += result["url_risk"]
+        url_risk_flags.extend(result["url_flags"])
+
+    # ── L1: Keywords ─────────────────────────────────────────────────────────
     kw_result          = detect_keywords(detection_text)
     matched_categories = kw_result["matched_categories"]
     matched_keywords   = kw_result["matched_keywords"]
@@ -669,15 +744,6 @@ def detect_phish(input_data: str, language: str = "en") -> dict:
 
     # ── L4: Safe patterns ─────────────────────────────────────────────────────
     safe_reduction, safe_signals = detect_safe_signals(detection_text)
-
-    # ── L5: URL intelligence ──────────────────────────────────────────────────
-    url_risk_total = 0
-    url_risk_flags: List[str] = []
-
-    for url_info in url_analysis:
-        result = analyze_url_risk(url_info)
-        url_risk_total += result["url_risk"]
-        url_risk_flags.extend(result["url_flags"])
 
     # ── Score assembly ────────────────────────────────────────────────────────
     raw_score  = base_score + combo_boost + ling_boost + url_risk_total + safe_reduction
@@ -770,7 +836,6 @@ def detect_phish(input_data: str, language: str = "en") -> dict:
 
     # ── Build final response ──────────────────────────────────────────────────
     final_result = {
-        # Core detection fields — never translated
         "is_scam":               is_scam,
         "risk_score":            risk_score,
         "category":              primary_category,
@@ -788,22 +853,18 @@ def detect_phish(input_data: str, language: str = "en") -> dict:
         "confidence_score":      confidence_score,
         "url_risk_flags":        url_risk_flags,
         "safe_signals_detected": safe_signals,
-        # User-facing fields — translated in L7 if language != "en"
         "user_message":          user_message,
         "user_action":           action,
     }
 
     # ── L6: LLM Second Opinion ────────────────────────────────────────────────
-    # Always receives English (detection_text, normalized if needed).
-    # Fires on all scores < 61. Can escalate safe → suspicious.
-    # Never changes risk_score, is_scam, red_flags, or scored fields.
+    # Not cached — LLM responses depend on rule_score context.
     if risk_score < 61:
         llm_result = analyze_with_llm(detection_text, risk_score)
 
         if llm_result:
             llm_verdict = llm_result.get("llm_verdict", "safe")
 
-            # Escalate: safe → suspicious if LLM catches social engineering
             if status == "safe" and llm_verdict in ("suspicious", "scam"):
                 final_result["status"]  = "suspicious"
                 final_result["is_scam"] = False
@@ -821,10 +882,9 @@ def detect_phish(input_data: str, language: str = "en") -> dict:
                 final_result["action"]      = llm_result["action"]
                 final_result["user_action"] = llm_result["action"]
 
-    # ── L7: Output Translation (googletrans) ──────────────────────────────────
-    # Runs last, after all detection and LLM are finalized.
-    # Translates ONLY user_message and user_action.
-    # All scored/analytical fields remain in English permanently.
+    # ── L7: Output Translation (cached via translate_text) ────────────────────
+    # translate_text() checks its own cache before calling googletrans.
+    # Only user_message and user_action are translated.
     if language != "en" and language in LANGUAGE_MAP:
         print(f"[L7] Translating output to '{language}'...")
         final_result["user_message"] = translate_text(
@@ -834,32 +894,35 @@ def detect_phish(input_data: str, language: str = "en") -> dict:
             final_result["user_action"], language
         )
 
+    # ── Store full result in detection cache ──────────────────────────────────
+    set_cache(detect_cache_key, final_result)
+    print(f"[Detection Cache] Stored result for future requests")
+
     return final_result
 
 # =============================================================================
 # API Routes
 # =============================================================================
 
-@app.get("/health", summary="Health check")
+@app.get("/health", summary="Health check + cache stats")
 def health_check():
+    stats = cache_stats()
     return {
-        "status": "ok",
-        "version": "2.0.0",
+        "status":             "ok",
+        "version":            "2.0.0",
         "supported_languages": len(LANGUAGE_MAP),
+        "cache":              stats,
     }
 
 
 @app.post("/detect", summary="Analyse text or URL for phishing/scam signals")
 def detect(request: DetectRequest):
     """
-    Multi-signal scam analysis with auto language normalization + translation.
+    Multi-signal scam analysis with caching + translation.
 
     Body: { "text": "...", "url": "...", "language": "en|hi|ml|ta|..." }
     - text/url : at least one required (any language)
     - language : output language code (default "en")
-
-    Non-English input is auto-translated to English for detection,
-    then the verdict is translated back to the user's selected language.
     """
     if not request.text and not request.url:
         raise HTTPException(
@@ -878,6 +941,7 @@ def detect(request: DetectRequest):
 # =============================================================================
 
 def run_cli():
+    init_cache()
     print("=" * 55)
     print("  PhishGuard v2.0 — Multi-Signal Scam Detection CLI")
     print("=" * 55)
