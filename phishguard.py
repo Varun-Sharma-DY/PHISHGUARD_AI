@@ -31,7 +31,6 @@ import sys
 import uvicorn
 import tldextract
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 
@@ -43,15 +42,6 @@ app = FastAPI(
     title="PhishGuard API",
     description="Multi-signal phishing & scam detection engine",
     version="2.0.0",
-)
-
-# Allow all origins so the HTML frontend can call the API from any port
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
 )
 
 # =============================================================================
@@ -629,83 +619,6 @@ def detect_phish(input_data: str) -> dict:
     }
 
 # =============================================================================
-# Input Pre-Processor
-# =============================================================================
-
-# Unicode ranges used for language detection
-_DEVANAGARI_RE = re.compile(r'[\u0900-\u097F]')   # Hindi + Marathi script
-_MARATHI_WORDS  = {"आहे", "नाही", "करा", "आपण", "हे", "ते", "करू", "नका", "वाटते", "असे"}
-_HINDI_WORDS    = {"है", "हैं", "नहीं", "करें", "आपका", "आपकी", "यह", "वह", "तुरंत", "जाएगा"}
-
-
-def detect_language(text: str) -> str:
-    """
-    Detect whether text is English, Hindi, or Marathi.
-
-    Strategy:
-      1. If no Devanagari script → English ("en")
-      2. If Devanagari present, check for known Marathi marker words → "mr"
-      3. Otherwise assume Hindi → "hi"
-
-    Returns one of: "en", "hi", "mr"
-    """
-    if not _DEVANAGARI_RE.search(text):
-        return "en"
-
-    words = set(text.split())
-    if words & _MARATHI_WORDS:
-        return "mr"
-
-    return "hi"
-
-
-def prepare_input(raw: str) -> dict:
-    """
-    Convert any raw user input string into the strict JSON structure
-    required by detect_phish() and the /detect API endpoint.
-
-    Handles:
-      - Plain English / Hindi / Marathi messages
-      - Bare URLs (text = url = the URL itself)
-      - Mixed messages containing embedded URLs
-      - Auto language detection (en / hi / mr)
-
-    Args:
-        raw: Any free-form string from the user.
-
-    Returns:
-        {
-            "text":     str,   # cleaned message (always populated)
-            "url":      str,   # first URL found, or "" if none
-            "language": str,   # "en" | "hi" | "mr"
-        }
-
-    Example:
-        >>> prepare_input("Click here: https://paytm-secure-login.xyz")
-        {"text": "Click here: https://paytm-secure-login.xyz",
-         "url": "https://paytm-secure-login.xyz", "language": "en"}
-
-        >>> prepare_input("आपका बैंक खाता बंद हो जाएगा")
-        {"text": "आपका बैंक खाता बंद हो जाएगा", "url": "", "language": "hi"}
-    """
-    # Normalise whitespace
-    text = " ".join(raw.strip().split())
-
-    # Extract first URL (if any)
-    urls = extract_urls(text)
-    url  = urls[0] if urls else ""
-
-    # Detect language
-    language = detect_language(text)
-
-    return {
-        "text":     text,
-        "url":      url,
-        "language": language,
-    }
-
-
-# =============================================================================
 # API Routes
 # =============================================================================
 
@@ -713,37 +626,6 @@ def prepare_input(raw: str) -> dict:
 def health_check():
     """Returns service liveness status."""
     return {"status": "ok", "version": "2.0.0"}
-
-
-@app.post("/analyze", summary="Raw text → auto-parse → detect (no manual JSON needed)")
-def analyze(payload: dict):
-    """
-    Accepts a simple { "input": "<raw message or url>" } body.
-
-    Internally calls prepare_input() to build the structured request,
-    then runs the full detection pipeline. No manual JSON formatting needed.
-
-    Example body:
-        { "input": "Your account is blocked. Update KYC immediately." }
-        { "input": "आपका बैंक खाता बंद कर दिया जाएगा" }
-        { "input": "https://paytm-secure-login.xyz" }
-    """
-    raw = payload.get("input", "").strip()
-    if not raw:
-        raise HTTPException(status_code=422, detail="Field 'input' is required and cannot be empty.")
-
-    structured = prepare_input(raw)
-    lang       = structured["language"]
-    template   = LANGUAGE_TEMPLATES.get(lang, LANGUAGE_TEMPLATES["en"])
-
-    result = detect_phish(structured["text"])
-
-    status = result["status"]
-    result["user_message"]    = template.get(status, template["safe"])
-    result["user_action"]     = template["action"]
-    result["parsed_input"]    = structured   # shows what was auto-detected
-
-    return result
 
 
 @app.post("/detect", summary="Analyse text or URL for phishing/scam signals")
@@ -766,6 +648,7 @@ def detect(request: DetectRequest):
 
     result = detect_phish(input_data)
 
+    # Localised user-facing verdict
     status = result["status"]
     result["user_message"] = template.get(status, template["safe"])
     result["user_action"]  = template["action"]
@@ -777,18 +660,15 @@ def detect(request: DetectRequest):
 # =============================================================================
 
 def run_cli():
-    """
-    Interactive CLI — just paste any raw message or URL.
-    prepare_input() handles all formatting automatically.
-    """
+    """Interactive CLI — prompts for input and language, prints verdict + JSON."""
     print("=" * 55)
     print("  PhishGuard v2.0 — Multi-Signal Scam Detection CLI")
     print("=" * 55)
-    print("Paste any message or URL — no formatting needed.")
-    print("Language is detected automatically. (Ctrl+C to quit)\n")
+    print("Enter text or a URL to analyse. (Ctrl+C to quit)\n")
 
     try:
-        user_input = input("Input : ").strip()
+        user_input = input("Input    : ").strip()
+        lang_input = input("Language [en/hi/mr, default en]: ").strip() or "en"
     except (KeyboardInterrupt, EOFError):
         print("\nExiting.")
         return
@@ -797,28 +677,19 @@ def run_cli():
         print("No input provided. Exiting.")
         return
 
-    # ── Auto-format the raw input ─────────────────────────────────────────────
-    structured = prepare_input(user_input)
-    lang       = structured["language"]
-    template   = LANGUAGE_TEMPLATES.get(lang, LANGUAGE_TEMPLATES["en"])
-
-    print(f"\n── Auto-detected input structure ──")
-    print(json.dumps(structured, indent=2, ensure_ascii=False))
-    print()
-
-    # ── Run detection ─────────────────────────────────────────────────────────
-    result = detect_phish(structured["text"])
+    lang     = lang_input if lang_input in LANGUAGE_TEMPLATES else "en"
+    template = LANGUAGE_TEMPLATES[lang]
+    result   = detect_phish(user_input)
 
     status = result["status"]
     result["user_message"] = template.get(status, template["safe"])
     result["user_action"]  = template["action"]
-    result["parsed_input"] = structured
 
-    print(f"{result['user_message']}")
+    print(f"\n{result['user_message']}")
     print(f"Risk Score : {result['risk_score']}/100  |  Confidence : {result['confidence_score']}%")
     print(f"Status     : {status.upper()}  |  Category : {result['primary_category']}")
     print(f"👉 {result['user_action']}\n")
-    print("─── Full Result ───")
+    print("─── Full JSON ───")
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 # =============================================================================
@@ -827,8 +698,6 @@ def run_cli():
 
 if __name__ == "__main__":
     if "--serve" in sys.argv:
-        # Pass app object directly — avoids Windows module-not-found error.
-        # reload=True requires uvicorn CLI and breaks on Windows path imports.
-        uvicorn.run(app, host="0.0.0.0", port=8000)
+        uvicorn.run("phishguard:app", host="0.0.0.0", port=8000, reload=True)
     else:
         run_cli()
